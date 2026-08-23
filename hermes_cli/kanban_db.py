@@ -808,6 +808,179 @@ def worker_logs_dir(board: Optional[str] = None) -> Path:
     return board_dir(slug) / "logs"
 
 
+# ---------------------------------------------------------------------------
+# Restricted lanes — private per-task worker artifacts
+# ---------------------------------------------------------------------------
+#
+# A board root can be a shared directory (a group-writable exchange dir, a
+# setgid project tree) so that several OS identities can run dispatchers
+# against the same board. That is the point of a shared board — and it means
+# every per-task artifact the dispatcher creates inherits the dispatcher's
+# umask. With a 002 umask under a 2775 root, a worker's workspace, its log
+# (the dispatcher's full stdout+stderr capture of the run, tool output
+# included) and its attachments are all readable by every identity in the
+# root's group.
+#
+# For most lanes that is fine and useful. For a *restricted* lane — one whose
+# transcript is the sensitive artifact, not just its result — it is not.
+# Naming such an assignee in ``kanban.restricted_lane_assignees`` makes the
+# dispatcher create that lane's per-task workspace, log and attachment
+# directory private to the identity that runs the worker, without moving the
+# board or changing any umask.
+#
+# Scope, stated plainly:
+#   * Per-task workspace dir, per-task log file, per-task attachments dir.
+#   * NOT ``kanban.db``. Card bodies, comments and completion summaries are
+#     a shared surface on a shared board by construction: every dispatcher
+#     and every worker on the board must read and write that one file. Do
+#     not put restricted-lane content in a card body, a comment or a
+#     completion summary — put it where the lane's own output goes.
+#   * NOT the shared ``workspaces/``, ``logs/`` and ``attachments/`` parents.
+#     Those stay group-traversable so other identities' dispatchers can keep
+#     writing their own tasks' artifacts alongside. A restricted lane's file
+#     names remain visible; their contents do not.
+#   * POSIX only. On Windows the mode bits are not enforced the same way,
+#     so a restricted lane there is not a security boundary.
+
+# Modes applied to a restricted lane's per-task artifacts.
+PRIVATE_DIR_MODE = 0o700
+PRIVATE_FILE_MODE = 0o600
+
+# Comma/whitespace-separated assignee patterns. Overrides config when set,
+# so a per-tier dispatcher wrapper can pin its own lanes without editing a
+# profile's config.yaml.
+RESTRICTED_LANES_ENV = "HERMES_KANBAN_RESTRICTED_LANES"
+
+
+class RestrictedLaneError(RuntimeError):
+    """A restricted lane's artifact could not be made private.
+
+    Raised instead of continuing: a restricted lane whose artifacts silently
+    stayed group-readable is the exact failure this feature exists to
+    prevent, so the dispatcher fails the spawn loudly rather than producing
+    a run whose transcript is readable by the whole group.
+    """
+
+
+def _split_lane_patterns(raw: Any) -> list[str]:
+    """Normalise a lane-pattern setting into a list of lowercase patterns."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items: Iterable[Any] = re.split(r"[,\s]+", raw)
+    elif isinstance(raw, (list, tuple, set)):
+        items = raw
+    else:
+        return []
+    out: list[str] = []
+    for item in items:
+        text = str(item).strip().lower()
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def restricted_lane_patterns() -> list[str]:
+    """Return the configured restricted-lane assignee patterns.
+
+    ``HERMES_KANBAN_RESTRICTED_LANES`` wins when set (including when set to
+    an empty string, which disables the feature for that process). Otherwise
+    ``kanban.restricted_lane_assignees`` from the dispatcher's config.
+    Patterns are shell globs matched case-insensitively against the
+    assignee, so ``paris-*`` covers a whole tier.
+    """
+    raw: Any = os.environ.get(RESTRICTED_LANES_ENV)
+    if raw is None:
+        try:
+            from hermes_cli.config import load_config
+
+            raw = (load_config().get("kanban") or {}).get(
+                "restricted_lane_assignees"
+            )
+        except Exception:  # config unreadable → feature simply off
+            raw = None
+    return _split_lane_patterns(raw)
+
+
+def is_restricted_lane(assignee: Optional[str]) -> bool:
+    """True when ``assignee`` names a lane whose artifacts must stay private."""
+    if not assignee:
+        return False
+    name = str(assignee).strip().lower()
+    if not name:
+        return False
+    from fnmatch import fnmatchcase
+
+    return any(fnmatchcase(name, pat) for pat in restricted_lane_patterns())
+
+
+def harden_private_path(path: Path, *, is_dir: bool) -> None:
+    """chmod ``path`` to owner-only and verify the filesystem honoured it.
+
+    ``chmod`` is verified rather than trusted: on filesystems that ignore
+    mode bits (some network mounts, Windows shares) the call succeeds and
+    changes nothing, which would leave a restricted lane exposed while
+    looking fixed. Raises :class:`RestrictedLaneError` on either failure.
+    """
+    mode = PRIVATE_DIR_MODE if is_dir else PRIVATE_FILE_MODE
+    try:
+        os.chmod(path, mode)
+        actual = os.stat(path).st_mode & 0o777
+    except OSError as exc:
+        raise RestrictedLaneError(
+            f"could not restrict {path} to mode {mode:04o}: {exc}"
+        ) from exc
+    if actual & 0o077:
+        raise RestrictedLaneError(
+            f"{path} is still group/other-accessible after chmod "
+            f"(mode {actual:04o}); this filesystem does not enforce POSIX "
+            "modes, so a restricted lane cannot be kept private here"
+        )
+
+
+def secure_lane_dir(path: Path, assignee: Optional[str]) -> None:
+    """Make ``path`` private when ``assignee`` is a restricted lane.
+
+    A no-op for ordinary lanes. Applied on every spawn, not just at
+    creation: ``mkdir(exist_ok=True)`` does not chmod, so a directory that
+    already exists from an earlier run (or from before the lane was
+    restricted) is re-hardened here.
+    """
+    if is_restricted_lane(assignee):
+        harden_private_path(path, is_dir=True)
+
+
+def secure_lane_file(path: Path, assignee: Optional[str]) -> None:
+    """Make ``path`` private when ``assignee`` is a restricted lane."""
+    if is_restricted_lane(assignee):
+        harden_private_path(path, is_dir=False)
+
+
+def _task_assignee(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Return a task's assignee, or None when it can't be read.
+
+    Used by the attachment write paths, which take ``conn`` + ``task_id``
+    rather than a :class:`Task`. A failure here means "not known to be
+    restricted", which is the same as today's behaviour.
+    """
+    try:
+        row = conn.execute(
+            "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return None
+    if not row:
+        return None
+    return row[0]
+
+
+def secure_task_attachment_dir(
+    conn: sqlite3.Connection, task_id: str, dest_dir: Path
+) -> None:
+    """Harden a per-task attachment directory for a restricted lane."""
+    secure_lane_dir(dest_dir, _task_assignee(conn, task_id))
+
+
 def board_metadata_path(board: Optional[str] = None) -> Path:
     """Return the path to ``board.json`` for ``board``.
 
@@ -4140,6 +4313,7 @@ def store_attachment_bytes(
     safe_name = _safe_attachment_name(filename)
     dest_dir = task_attachments_dir(task_id, board=board)
     dest_dir.mkdir(parents=True, exist_ok=True)
+    secure_task_attachment_dir(conn, task_id, dest_dir)
     dest_path = _collision_free_path(dest_dir, safe_name)
     dest_path.write_bytes(data)
     try:
@@ -5719,6 +5893,7 @@ def _persist_scratch_completion_artifacts(
         dest: Optional[Path] = None
         try:
             attachment_dir.mkdir(parents=True, exist_ok=True)
+            secure_task_attachment_dir(conn, task_id, attachment_dir)
             dest = _unique_attachment_path(attachment_dir, resolved_src.name, used_destinations)
             with resolved_src.open("rb") as source_file, dest.open("xb") as destination_file:
                 copied = 0
@@ -7854,6 +8029,13 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
+
+    When ``task.assignee`` names a restricted lane (see
+    :func:`is_restricted_lane`) the resolved directory is chmod'd to 0700
+    afterwards, so a shared board root does not hand the lane's working
+    files to every identity in the root's group. This runs on every resolve,
+    because ``mkdir(exist_ok=True)`` leaves an existing directory's mode
+    alone.
     """
     kind = task.workspace_kind or "scratch"
     if kind == "scratch":
@@ -7870,6 +8052,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
         else:
             p = workspaces_root(board=board) / task.id
         p.mkdir(parents=True, exist_ok=True)
+        secure_lane_dir(p, task.assignee)
         return p
     if kind == "dir":
         if not task.workspace_path:
@@ -7884,9 +8067,14 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
                 f"(relative paths are ambiguous against the dispatcher's CWD)"
             )
         p.mkdir(parents=True, exist_ok=True)
+        # `dir:` workspaces are explicitly chosen by whoever created the
+        # task, and are often shared on purpose (a checkout two lanes both
+        # work in). Restricting one would silently break the other lane, so
+        # a restricted lane's privacy here is the operator's call, not ours.
         return p
     if kind == "worktree":
         p, _branch_name = _resolve_worktree_workspace(task, board=board)
+        secure_lane_dir(p, task.assignee)
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -10824,6 +11012,12 @@ def _default_spawn(
     # board slug still forces it to the right directory.
     resolved_board = _normalize_board_slug(board) or get_current_board()
     env["HERMES_KANBAN_BOARD"] = resolved_board
+    # Pin the restricted-lane list the DISPATCHER resolved. The worker runs
+    # under its own profile's HERMES_HOME, so it would otherwise read that
+    # profile's config — and a restricted lane whose own profile forgot the
+    # setting would attach files into a group-readable directory. Pinning it
+    # here makes the dispatcher's policy the one that applies to the run.
+    env[RESTRICTED_LANES_ENV] = ",".join(restricted_lane_patterns())
     # HERMES_PROFILE is the author the kanban_comment tool defaults to.
     # `hermes -p <assignee>` activates the profile, but the env var is
     # what the tool reads — set it explicitly here so comments are
@@ -10896,6 +11090,22 @@ def _default_spawn(
 
     # Use 'a' so a re-run on unblock appends rather than overwrites.
     log_f = open(log_path, "ab")
+    # A worker log is the dispatcher's whole stdout+stderr capture of the
+    # run — tool output included, not just the worker's prose — so for a
+    # restricted lane it is the most sensitive artifact the board produces.
+    # Harden it after open() and before the child writes a byte: the child
+    # inherits the already-open fd, so the mode change cannot race the
+    # transcript. Rotated generations are hardened too; the .1 file holds
+    # exactly the same kind of content as the live one.
+    try:
+        secure_lane_file(log_path, task.assignee)
+        for generation in range(1, max(backup_count, 0) + 1):
+            rotated = _rotated_log_path(log_path, generation)
+            if rotated.exists():
+                secure_lane_file(rotated, task.assignee)
+    except RestrictedLaneError:
+        log_f.close()
+        raise
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,

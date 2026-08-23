@@ -2643,6 +2643,26 @@ DEFAULT_CONFIG = {
         # raise these to keep more early failure evidence.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Assignees whose per-task worker artifacts must not be readable by
+        # other identities sharing the board root. A shared board root (a
+        # group-writable exchange directory, a setgid project tree) means
+        # every per-task workspace, worker log and attachment directory the
+        # dispatcher creates inherits its umask — so on a 002 umask under a
+        # 2775 root they are group-readable, and a worker log is the whole
+        # stdout+stderr capture of the run, tool output included. Naming a
+        # lane here makes the dispatcher chmod that lane's per-task
+        # workspace, log and attachment dir to owner-only (0700/0600).
+        # Entries are shell globs matched case-insensitively against the
+        # assignee, so "paris-*" covers a tier. Empty (the default) means
+        # every lane keeps today's behaviour.
+        #
+        # NOT covered, deliberately: kanban.db. Card bodies, comments and
+        # completion summaries are a shared surface on a shared board by
+        # construction — every dispatcher and worker on the board reads and
+        # writes that one file. Keep restricted content out of card text.
+        # POSIX only; Windows does not enforce these modes the same way.
+        # Overridable per-process via HERMES_KANBAN_RESTRICTED_LANES.
+        "restricted_lane_assignees": [],
         # Profile assigned to the root/orchestration task after Triage
         # decomposition. When unset, falls back to the default profile (the
         # one `hermes` launches with no -p flag). This does not control the
