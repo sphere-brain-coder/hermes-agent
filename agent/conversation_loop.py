@@ -8224,11 +8224,15 @@ def run_conversation(
                     continue
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
-                # Workers must end with kanban_complete / kanban_block.
-                # Models sometimes narrate the next step ("Let me write the
+                # Workers must end with a terminal board tool:
+                # kanban_complete / kanban_block, or the review-lane pair
+                # kanban_request_review / kanban_request_changes. Models
+                # sometimes narrate the next step ("Let me write the
                 # report") and stop with finish_reason=stop — a clean exit
                 # that the dispatcher records as protocol_violation. Nudge
-                # once or twice before allowing that exit.
+                # once or twice before allowing that exit. The guard also
+                # consults the board DB, so a run already closed there never
+                # gets nudged.
                 try:
                     from agent.kanban_stop import build_kanban_stop_nudge
 
