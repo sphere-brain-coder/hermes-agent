@@ -736,6 +736,7 @@ async def upload_task_attachment(
         # the disk. Read in chunks; abort + clean up if the cap is hit.
         dest_dir = kanban_db.task_attachments_dir(task_id, board=board)
         dest_dir.mkdir(parents=True, exist_ok=True)
+        kanban_db.secure_task_attachment_dir(conn, task_id, dest_dir)
 
         # Resolve name collisions: foo.pdf → foo (1).pdf, foo (2).pdf, …
         dest_path = _collision_free_path(dest_dir, safe_name)

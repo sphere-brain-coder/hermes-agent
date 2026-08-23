@@ -79,6 +79,32 @@ The dispatcher writes per-task worker stdout/stderr to `<board-root>/logs/<task_
 
 The dashboard renders run history with summaries, metadata blocks, and exit-status badges. CLI users can run `hermes kanban tail <task_id>` to follow live, or `hermes kanban runs <task_id>` for the historical attempt list.
 
+## Restricted lanes (private per-task artifacts)
+
+A board root can be shared between OS identities — a group-writable exchange directory, a setgid project tree — so that several users can dispatch against one board. Every per-task artifact the dispatcher creates then inherits the dispatcher's umask. Under a `002` umask on a `2775` root, that means a worker's workspace, its log and its attachments are readable by every identity in the root's group. The log matters most: it is the dispatcher's whole stdout/stderr capture of the run, so it holds tool output, not just the worker's prose.
+
+For most lanes that is useful. For a lane whose *transcript* is the sensitive artifact, not just its result, it is not. List those assignees under `kanban.restricted_lane_assignees`:
+
+```yaml
+kanban:
+  restricted_lane_assignees:
+    - finance-*        # shell glob, matched case-insensitively
+    - legal-review
+```
+
+The dispatcher then chmods that lane's **per-task** workspace (`0700`), worker log and rotated generations (`0600`), and attachment directory (`0700`). It re-applies these on every spawn, because `mkdir(exist_ok=True)` does not chmod: a directory left group-readable by an earlier run is tightened on the next one. `HERMES_KANBAN_RESTRICTED_LANES` overrides the config for one process (comma or whitespace separated; an empty value disables the feature), and the dispatcher pins its own resolved list into worker env so a worker cannot re-decide the policy from its own profile's config.
+
+What this deliberately does **not** cover:
+
+| Not covered | Why |
+|---|---|
+| `kanban.db` | Card bodies, comments and completion summaries are a shared surface on a shared board by construction — every dispatcher and worker on the board reads and writes that one file. Keep restricted content out of card text; put it where the lane's own output goes. |
+| The shared `workspaces/`, `logs/`, `attachments/` parents | They stay group-traversable so other identities' dispatchers can keep creating their own tasks' artifacts under the same root. A restricted lane's file *names* stay visible; contents do not. |
+| `dir:` workspaces | An explicit `workspace_path` is chosen by whoever created the task and is often shared on purpose. Restricting it would break the other lane using it, so that is the operator's call. |
+| Windows | Mode bits are not enforced the same way. A restricted lane there is not a security boundary. |
+
+If a chmod fails, or the filesystem accepts it and changes nothing (some network mounts), the spawn raises `RestrictedLaneError` rather than running a worker whose transcript would be readable by the whole group.
+
 ## Existing lane shapes
 
 ### Hermes profile lane (default)
