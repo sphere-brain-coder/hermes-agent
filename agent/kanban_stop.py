@@ -63,6 +63,28 @@ _DEFAULT_MAX_ATTEMPTS = 2
 #: falls back to the transcript scan.
 _DB_TIMEOUT_SECONDS = 2.0
 
+#: The one row the guard needs: is a run still open, and who owns the card.
+_TASK_ROW_SQL = """
+    SELECT t.current_run_id AS current_run_id,
+           r.ended_at       AS ended_at,
+           r.outcome        AS outcome,
+           t.assignee       AS assignee
+      FROM tasks t
+      LEFT JOIN task_runs r ON r.id = t.current_run_id
+     WHERE t.id = ?
+"""
+
+#: Same query for a board old enough to predate ``tasks.assignee``. Run state
+#: is still answerable there, so a missing column costs ownership only.
+_TASK_ROW_SQL_NO_ASSIGNEE = """
+    SELECT t.current_run_id AS current_run_id,
+           r.ended_at       AS ended_at,
+           r.outcome        AS outcome
+      FROM tasks t
+      LEFT JOIN task_runs r ON r.id = t.current_run_id
+     WHERE t.id = ?
+"""
+
 
 def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
@@ -127,15 +149,13 @@ def _kanban_db_path() -> Optional[str]:
         return None
 
 
-def kanban_run_is_over(task_id: Optional[str] = None) -> Optional[bool]:
-    """Ask the board DB whether this worker's run has already ended.
+def _read_task_row(task_id: Optional[str] = None) -> Optional[tuple]:
+    """Read the board columns the guard cares about, or None if unreadable.
 
-    Returns ``True`` when the run row is closed (``task_runs.ended_at`` is
-    set) or the task carries no current run (``tasks.current_run_id IS
-    NULL``), ``False`` when a run is demonstrably still open, and ``None``
-    when the question cannot be answered (no task id, DB missing, unreadable,
-    or a schema without the columns). ``None`` means "unknown", so callers
-    must fall back to their own signal rather than assume either answer.
+    Returns ``(current_run_id, ended_at, outcome, assignee)``. ``None`` means
+    the question cannot be answered at all (no task id, DB missing, locked,
+    corrupt, or the task is not on this board) and callers must treat that as
+    unknown rather than assuming a value.
 
     Read-only by construction: opened with ``mode=ro`` and never written.
     """
@@ -153,17 +173,15 @@ def kanban_run_is_over(task_id: Optional[str] = None) -> Optional[bool]:
     try:
         uri = f"file:{quote(path)}?mode=ro"
         conn = sqlite3.connect(uri, uri=True, timeout=_DB_TIMEOUT_SECONDS)
-        row = conn.execute(
-            """
-            SELECT t.current_run_id AS current_run_id,
-                   r.ended_at       AS ended_at,
-                   r.outcome        AS outcome
-              FROM tasks t
-              LEFT JOIN task_runs r ON r.id = t.current_run_id
-             WHERE t.id = ?
-            """,
-            (tid,),
-        ).fetchone()
+        try:
+            row = conn.execute(_TASK_ROW_SQL, (tid,)).fetchone()
+        except sqlite3.OperationalError:
+            # Board predates tasks.assignee. Run state is still answerable
+            # from tasks/task_runs alone, so degrade to that rather than
+            # reporting the whole row as unknown.
+            row = conn.execute(_TASK_ROW_SQL_NO_ASSIGNEE, (tid,)).fetchone()
+            if row is not None:
+                row = (row[0], row[1], row[2], None)
     except Exception:
         # Locked, missing, WAL sidecar unreadable, older schema — all mean
         # "no authoritative answer", never "the run is still open".
@@ -179,7 +197,14 @@ def kanban_run_is_over(task_id: Optional[str] = None) -> Optional[bool]:
     if row is None:
         # Task not on this board. Unknown, not "running".
         return None
-    current_run_id, ended_at, outcome = row[0], row[1], row[2]
+    return (row[0], row[1], row[2], row[3])
+
+
+def _run_is_over_from_row(row: Optional[tuple]) -> Optional[bool]:
+    """Classify a row from :func:`_read_task_row` as over / open / unknown."""
+    if row is None:
+        return None
+    current_run_id, ended_at, outcome, _assignee = row
     if current_run_id is None:
         return True
     if ended_at is not None:
@@ -187,6 +212,67 @@ def kanban_run_is_over(task_id: Optional[str] = None) -> Optional[bool]:
     if outcome is not None and str(outcome) in _TERMINAL_RUN_OUTCOMES:
         return True
     return False
+
+
+def _assignee_from_row(row: Optional[tuple]) -> Optional[str]:
+    """Pull a usable assignee out of a row, or None when there isn't one."""
+    if row is None:
+        return None
+    assignee = row[3]
+    if assignee is None:
+        return None
+    assignee = str(assignee).strip()
+    return assignee or None
+
+
+def kanban_run_is_over(task_id: Optional[str] = None) -> Optional[bool]:
+    """Ask the board DB whether this worker's run has already ended.
+
+    Returns ``True`` when the run row is closed (``task_runs.ended_at`` is
+    set) or the task carries no current run (``tasks.current_run_id IS
+    NULL``), ``False`` when a run is demonstrably still open, and ``None``
+    when the question cannot be answered (no task id, DB missing, unreadable,
+    or a schema without the columns). ``None`` means "unknown", so callers
+    must fall back to their own signal rather than assume either answer.
+    """
+    return _run_is_over_from_row(_read_task_row(task_id))
+
+
+def kanban_task_assignee(task_id: Optional[str] = None) -> Optional[str]:
+    """Return the profile the board currently assigns this task to.
+
+    ``None`` when unknown: unreadable board, task absent, or a NULL/blank
+    assignee. Unknown must never be read as "not yours"; the caller keeps
+    every remedy on offer rather than removing one on a guess.
+    """
+    return _assignee_from_row(_read_task_row(task_id))
+
+
+def _worker_profile() -> Optional[str]:
+    """This worker's own profile name, or None when it cannot be determined."""
+    for var in ("HERMES_PROFILE", "HERMES_PROFILE_NAME"):
+        value = (os.environ.get(var) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _handed_off_to(assignee: Optional[str]) -> Optional[str]:
+    """The other profile a card now belongs to, or None.
+
+    Returns the assignee only when the board and this worker's identity are
+    both known and they differ. Any unknown on either side returns ``None``,
+    because "we cannot tell who owns this" must not be reported as "someone
+    else owns this".
+    """
+    if not assignee:
+        return None
+    me = _worker_profile()
+    if not me:
+        return None
+    if assignee.casefold() == me.casefold():
+        return None
+    return assignee
 
 
 def build_kanban_stop_nudge(
@@ -209,24 +295,65 @@ def build_kanban_stop_nudge(
         return None
     if session_called_kanban_terminal(messages):
         return None
+    # One board read serves both questions; this runs on the worker's exit
+    # path, so it must not open the DB twice.
+    row = _read_task_row(task_id)
     # The DB outranks the transcript. A closed run row means the worker did
     # transition the board, even if this process cannot see the call.
-    if kanban_run_is_over(task_id) is True:
+    run_is_over = _run_is_over_from_row(row)
+    if run_is_over is True:
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    if run_is_over is False:
+        # The board confirmed an open run row. This is the only branch where
+        # asserting `running` is a fact rather than a guess.
+        state = (
+            f"Task `{tid}` is still `running`. Ending now without a board tool "
+            "causes a protocol violation (clean exit with no terminal kanban "
+            "call)."
+        )
+    else:
+        # Unknown: no task id, DB missing, locked, corrupt, or the task lives
+        # on another board. Say that, rather than asserting a status that was
+        # never read. Claiming `running` against a card parked in `review` is
+        # the false assertion this guard exists to stop making.
+        state = (
+            f"Could not read the board for task `{tid}`, so its status is "
+            "unknown here. If you have not already ended this run with a "
+            "terminal board tool, ending now causes a protocol violation "
+            "(clean exit with no terminal kanban call). If you already called "
+            "one, ignore this message and finish."
+        )
+
+    # A card whose assignee is no longer this worker has been handed on, so
+    # completion is somebody else's verb. Offering it invites the worker to
+    # self-promote past the very review it just requested.
+    handed_off_to = _handed_off_to(_assignee_from_row(row))
+    if handed_off_to:
+        ownership = (
+            f"\nThe board assigns this card to `{handed_off_to}`, not to you, "
+            "so `kanban_complete` is not yours to call here: completion is the "
+            f"approval verb and it belongs to `{handed_off_to}`.\n"
+        )
+        complete_line = ""
+    else:
+        ownership = ""
+        complete_line = (
+            "   - `kanban_complete(summary=..., artifacts=[...])` if the work is "
+            "done (on a review-gated board this is the approval verb, so never "
+            "use it to record a rejection);\n"
+        )
+
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
-        f"Task `{tid}` is still `running`. Ending now without a board tool "
-        "causes a protocol violation (clean exit with no terminal kanban "
-        "call).\n\n"
+        f"{state}\n"
+        f"{ownership}\n"
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. End the run with exactly one terminal board tool:\n"
-        "   - `kanban_complete(summary=..., artifacts=[...])` if the work is "
-        "done (on a review-gated board this is the approval verb, so never "
-        "use it to record a rejection);\n"
+        f"{complete_line}"
         "   - `kanban_request_review(summary=...)` if you implemented the "
         "change and a reviewer must sign it off;\n"
         "   - `kanban_request_changes(reason=...)` if you are the reviewer "
@@ -242,5 +369,6 @@ __all__ = [
     "build_kanban_stop_nudge",
     "kanban_run_is_over",
     "kanban_stop_nudge_enabled",
+    "kanban_task_assignee",
     "session_called_kanban_terminal",
 ]
