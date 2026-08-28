@@ -352,7 +352,7 @@ That pin has to be chosen before the server's capabilities are known, because th
 
 - A server Hermes has connected to before, whose cached metadata does not advertise CIMD, keeps the random port it has always used.
 - A server Hermes has never reached gets a pinned port on that first login, since guessing is the only way CIMD can ever be used.
-- Anything that would move the callback elsewhere reverts too: a pre-registered `oauth.client_id`, an `oauth.client_secret`, a custom `oauth.client_name` or `oauth.token_endpoint_auth_method`, an `oauth.redirect_uri` or `oauth.redirect_port` override, a dashboard- or desktop-driven login, an existing client registration on disk, or all five ports being held by other processes.
+- Anything that would move the callback elsewhere reverts too: a pre-registered `oauth.client_id`, an `oauth.client_secret`, a custom `oauth.client_name` or `oauth.token_endpoint_auth_method`, an `oauth.redirect_uri` or `oauth.redirect_port` override, a configured public redirect base (see below), a dashboard- or desktop-driven login, an existing client registration on disk, or all five ports being held by other processes.
 
 Each pinned port is bound as soon as it is chosen and held until the browser redirect arrives, so two concurrent logins — a second profile, or another server in the same process — cannot land on the same listener.
 
@@ -378,6 +378,47 @@ mcp_servers:
 `client_metadata_url` must be an HTTPS URL with a path (no bare origin, no fragment, no userinfo, no `.`/`..` segments) that returns `200` and `Content-Type: application/json` with **no redirect** — authorization servers are forbidden from following redirects when fetching it. Hermes still pins its callback to the same `27890`–`27894` range, so a self-hosted document must declare all ten loopback URIs (`http://127.0.0.1:<port>/callback` and `http://localhost:<port>/callback` for each port), and its `client_id` must be its own URL.
 
 `user_agent` replaces the HTTP library's default `User-Agent` on **token-endpoint requests only** (authorization-code exchange and refresh) — some authorization servers and WAFs reject the default `python-httpx/...` value there. It never applies to MCP traffic or OAuth discovery, and no other token-request headers are configurable. Empty or null values are ignored.
+
+### Headless boxes: a public callback URL
+
+The default callback is `http://127.0.0.1:<port>/callback`, which only works when the browser doing the authorizing runs on the same machine as Hermes. On a headless server it never does: the operator authorizes from their own laptop, and that browser cannot reach the server's loopback.
+
+If something fronts Hermes and can forward `<base>/oauth/cb/<flow-id>` to the flow's local listener, point Hermes at it:
+
+```bash
+export HERMES_MCP_OAUTH_REDIRECT_BASE="https://os.example.com"
+```
+
+or in `config.yaml`:
+
+```yaml
+mcp:
+  oauth_redirect_base: "https://os.example.com"
+```
+
+or for one server only:
+
+```yaml
+mcp_servers:
+  protected_api:
+    url: "https://mcp.example.com/mcp"
+    auth: oauth
+    oauth:
+      redirect_base: "https://os.example.com"
+      register_loopback_redirect: true   # default
+```
+
+Per-server `redirect_base` wins, then the environment variable, then `mcp.oauth_redirect_base`. **Unset everywhere means nothing changes** — the loopback default stays exactly as it was, which is what every desktop install wants.
+
+What happens with a base set:
+
+- Registration declares **both** URIs, public first: `https://os.example.com/oauth/cb/<flow-id>` and `http://127.0.0.1:<port>/callback`. The SDK sends the first on the authorization request, and the loopback one keeps a local browser (or an SSH tunnel) working against the same client registration. Set `register_loopback_redirect: false` for the rare authorization server that refuses a registration mixing public and loopback URIs.
+- **The flow still listens on loopback.** A public base changes what is *registered*, never where Hermes listens, so the gateway has a real local port to forward to. `hermes mcp login` prints the public URI and that port together.
+- The flow id is a stable digest of the server name, so it survives a restart. A random per-process id would present a redirect URI the stored client registration never declared, and the authorization server would reject it.
+- CIMD is skipped for that flow: the published document declares only the pinned loopback URIs, and the spec requires an exact string match, so the flow uses DCR instead.
+- A base that is not an `http(s)` origin, or that carries a query or fragment, is ignored with a warning and the loopback callback is used. `oauth.redirect_uri` still overrides everything.
+
+Hermes does not configure the gateway. Forwarding `<base>/oauth/cb/<flow-id>` to `http://127.0.0.1:<port>/callback` is the deployment's job.
 
 ## Add to Hermes link
 
