@@ -688,6 +688,17 @@ DEFAULT_CONFIG = {
         # When disabled, the watcher still detects the change and prints
         # guidance to apply it deliberately via /reload-mcp.
         "auto_reload_on_config_change": True,
+
+        # Public base URL for MCP OAuth callbacks. Unset (the default) keeps
+        # the loopback callback every desktop install uses. Set it only when
+        # a gateway in front of Hermes forwards <base>/oauth/cb/<flow-id> to
+        # the flow's local listener — the headless case, where the browser
+        # doing the authorizing runs on someone else's machine and can never
+        # reach this box's 127.0.0.1. The flow still listens on loopback;
+        # only the *registered* redirect_uri changes. Env override:
+        # HERMES_MCP_OAUTH_REDIRECT_BASE. Per-server override:
+        # mcp_servers.<name>.oauth.redirect_base.
+        "oauth_redirect_base": None,
     },
 
     # Tool-output truncation thresholds. When terminal output or a

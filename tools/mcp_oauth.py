@@ -37,13 +37,27 @@ Configuration in config.yaml::
           redirect_port: 0                      # 0 = auto-pick free port
           redirect_uri: "https://proxy/callback"  # default: loopback callback
           redirect_host: "localhost"            # loopback hostname (WAF-safe)
+          redirect_base: "https://os.example.com"  # public gateway callback base
+          register_loopback_redirect: true      # also register the loopback URI
           client_name: "My Custom Client"       # default: "Hermes Agent"
           client_metadata_url: "https://me/cimd.json"  # self-hosted CIMD
           cimd: false                           # force DCR for this server
+
+Headless deployments (``HERMES_MCP_OAUTH_REDIRECT_BASE``)::
+
+    A browser on someone else's laptop cannot reach this machine's
+    ``http://127.0.0.1:<port>/callback``. When a gateway in front of Hermes
+    forwards ``<base>/oauth/cb/<flow-id>`` to the flow's local listener, set
+    ``HERMES_MCP_OAUTH_REDIRECT_BASE`` (or ``mcp.oauth_redirect_base`` in
+    config.yaml, or per-server ``oauth.redirect_base``) and Hermes registers
+    that public URI instead. Both URIs are registered by default so a local
+    browser keeps working; the listener is unchanged and still binds loopback.
+    Unset means the loopback default, exactly as before.
 """
 
 import asyncio
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -844,15 +858,24 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         print(msg, file=sys.stderr)
 
         on_ssh = bool(os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY"))
-        if on_ssh and redirect_uri:
-            # A configured proxy callback (e.g. Tailscale Funnel) forwards the
-            # redirect to the listener on this machine, so no tunnel/paste is needed.
+        if redirect_uri:
+            # A public/proxied callback (gateway forward, Tailscale Funnel)
+            # reaches the listener on this machine by itself. Print the pairing
+            # — public URI plus the local port it lands on — unconditionally:
+            # a headless box has no browser at all, so the operator (or the
+            # fronting gateway) needs both halves regardless of SSH.
             print(
-                f"  Remote session detected. After you authorize, the provider redirects to\n"
+                f"  After you authorize, the provider redirects to\n"
                 f"    {redirect_uri}\n"
-                f"  which forwards to the callback listener on this machine — no SSH tunnel needed.\n",
+                f"  which forwards to the callback listener on this machine "
+                f"(local port {port}).\n",
                 file=sys.stderr,
             )
+            if on_ssh:
+                print(
+                    "  Remote session detected — no SSH tunnel needed.\n",
+                    file=sys.stderr,
+                )
         elif on_ssh and port:
             # Loopback default: the provider redirects to
             # http://127.0.0.1:<port>/callback, which reaches the callback server on
@@ -1483,6 +1506,13 @@ def _maybe_use_cimd(
     if cfg.get("redirect_uri") or cfg.get("redirect_port"):
         return None
 
+    # A public gateway callback is deployment-specific for the same reason:
+    # the published document declares only the pinned loopback URIs, and the
+    # spec requires an exact string match, so presenting the document while
+    # requesting <base>/oauth/cb/<fid> aborts at the authorization endpoint.
+    if _public_redirect_base(cfg):
+        return None
+
     if (cfg.get("redirect_host") or "127.0.0.1") not in _CIMD_REDIRECT_HOSTS:
         return None
 
@@ -1553,6 +1583,12 @@ def _configure_callback_port(
     A CIMD-eligible flow also records the client_id URL in
     ``cfg['_cimd_url']`` for the provider constructors to forward.
 
+    When a public redirect base is configured, ``cfg['_flow_id']`` is set from
+    the server name so ``_resolve_redirect_uri`` can build
+    ``<base>/oauth/cb/<flow-id>``. The port is still a real local port: the
+    fronting gateway forwards that path to this listener, so a public
+    redirect_uri never means "no listener".
+
     NOTE: also sets the legacy module-level ``_oauth_port`` so existing
     calls to ``_wait_for_callback`` keep working. The legacy global is
     the root cause of issue #5344 (port collision on concurrent OAuth
@@ -1562,13 +1598,25 @@ def _configure_callback_port(
     global _oauth_port
     from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
+    if storage is not None and not cfg.get("_flow_id"):
+        cfg["_flow_id"] = oauth_flow_id(storage._server_name)
+
     dashboard_flow = get_dashboard_oauth_flow()
     if dashboard_flow is not None:
         cfg["_resolved_port"] = 0
         cfg["redirect_uri"] = cfg.get("redirect_uri") or dashboard_flow.redirect_uri
         return 0
     cached_redirect_uri = _cached_redirect_uri(storage)
-    if not cfg.get("redirect_uri") and cached_redirect_uri:
+    if (
+        not cfg.get("redirect_uri")
+        and cached_redirect_uri
+        and not _public_redirect_base(cfg)
+    ):
+        # Only pin the cached non-loopback URI when this deployment is NOT
+        # running a public-base flow. Under a public base the cached https URI
+        # is one *we* registered, and re-pinning it as an explicit
+        # ``redirect_uri`` would suppress the loopback URI and collapse the
+        # port to 0 — a random listener the gateway does not forward to.
         cfg["redirect_uri"] = cached_redirect_uri
         cfg["_resolved_port"] = 0
         return 0
@@ -1597,28 +1645,161 @@ def _configure_callback_port(
     return port
 
 
-def _resolve_redirect_uri(cfg: dict, port: int) -> str:
-    """Resolve the OAuth callback URL: configured ``redirect_uri`` or loopback.
+def oauth_flow_id(server_name: str) -> str:
+    """Stable, URL-safe flow id for *server_name*'s public callback path.
 
-    A configured ``redirect_uri`` lets the callback go through a proxy (e.g. a
-    Tailscale Funnel exposing a public HTTPS URL that forwards to localhost);
-    otherwise we default to ``http://<redirect_host>:<port>/callback``. An empty
-    value is treated as unset. Both the client metadata and any pre-registered
-    client info must derive the redirect_uri here so they stay identical — a
-    mismatch makes the authorization server reject the callback.
+    The id is part of a redirect URI that gets *registered* with the
+    authorization server, so it must survive a restart: a per-process random
+    value would make the next login present a redirect URI the stored client
+    registration never declared, and the server rejects it as a mismatch.
+    A digest of the server name gives that stability without leaking the name
+    into a URL a provider (and its logs) can read.
+    """
+    return hashlib.sha256(f"hermes-mcp-oauth:{server_name}".encode()).hexdigest()[:16]
+
+
+def _config_redirect_base() -> str | None:
+    """``mcp.oauth_redirect_base`` from config.yaml, or None.
+
+    Split out so the env var stays usable in contexts where loading
+    config.yaml is impossible or undesirable (and so tests can patch one
+    source without touching the other).
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        mcp_cfg = (load_config_readonly() or {}).get("mcp")
+    except Exception:  # config unreadable/absent — env var still works
+        return None
+    if not isinstance(mcp_cfg, dict):
+        return None
+    base = mcp_cfg.get("oauth_redirect_base")
+    return base if isinstance(base, str) and base.strip() else None
+
+
+def _normalize_redirect_base(base: str | None) -> str | None:
+    """Validate a public redirect base, returning it without a trailing slash.
+
+    Returns None (and logs) for anything that cannot produce a working
+    ``<base>/oauth/cb/<flow-id>`` URL. Falling back to loopback on a malformed
+    base is deliberate: a silently mangled redirect URI fails much later, at
+    the authorization endpoint, with an error that names nothing useful.
+    """
+    if not isinstance(base, str):
+        return None
+    base = base.strip().rstrip("/")
+    if not base:
+        return None
+    try:
+        parsed = urlparse(base)
+    except ValueError:
+        parsed = None
+    if (
+        parsed is None
+        or parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        logger.warning(
+            "MCP OAuth: ignoring invalid public redirect base %r — expected an "
+            "http(s) origin with no query or fragment, e.g. "
+            "https://os.example.com. Falling back to the loopback callback.",
+            base,
+        )
+        return None
+    return base
+
+
+def _public_redirect_base(cfg: dict) -> str | None:
+    """The gateway base for this flow's public callback, or None for loopback.
+
+    Precedence: per-server ``oauth.redirect_base`` > the
+    ``HERMES_MCP_OAUTH_REDIRECT_BASE`` env var > ``mcp.oauth_redirect_base``
+    in config.yaml. Unset everywhere means the loopback default, which is what
+    every desktop install keeps.
+    """
+    for candidate in (
+        cfg.get("redirect_base"),
+        os.getenv("HERMES_MCP_OAUTH_REDIRECT_BASE"),
+        _config_redirect_base(),
+    ):
+        if candidate:
+            normalized = _normalize_redirect_base(candidate)
+            if normalized:
+                return normalized
+    return None
+
+
+def _public_redirect_uri(cfg: dict) -> str | None:
+    """``<base>/oauth/cb/<flow-id>`` when a public base applies, else None.
+
+    Needs ``cfg['_flow_id']`` (set by :func:`_configure_callback_port`). Without
+    one there is no path to forward, so the caller keeps loopback.
+    """
+    base = _public_redirect_base(cfg)
+    if not base:
+        return None
+    flow_id = cfg.get("_flow_id")
+    if not flow_id:
+        return None
+    return f"{base}/oauth/cb/{flow_id}"
+
+
+def _loopback_redirect_uri(cfg: dict, port: int) -> str:
+    """The ``http://<redirect_host>:<port>/callback`` the listener answers on."""
+    host = cfg.get("redirect_host") or "127.0.0.1"
+    return f"http://{host}:{port}/callback"
+
+
+def _redirect_uris(cfg: dict, port: int) -> list[str]:
+    """Every redirect URI to register, most-preferred first.
+
+    With a public base configured the list is ``[public, loopback]``: the SDK
+    sends ``redirect_uris[0]`` on the authorization request, and registering
+    the loopback one alongside it keeps a local browser (or an SSH tunnel)
+    working against the same client registration. Set
+    ``oauth.register_loopback_redirect: false`` for the authorization servers
+    that refuse a registration mixing public and loopback URIs.
+    """
+    configured = cfg.get("redirect_uri")
+    if configured:
+        return [configured]
+    loopback = _loopback_redirect_uri(cfg, port)
+    public = _public_redirect_uri(cfg)
+    if not public:
+        return [loopback]
+    if cfg.get("register_loopback_redirect") is False:
+        return [public]
+    return [public, loopback]
+
+
+def _resolve_redirect_uri(cfg: dict, port: int) -> str:
+    """Resolve the OAuth callback URL the authorization request will carry.
+
+    An explicit ``redirect_uri`` wins: it lets the callback go through a proxy
+    (e.g. a Tailscale Funnel exposing a public HTTPS URL that forwards to
+    localhost). Next comes a configured public redirect base, which builds
+    ``<base>/oauth/cb/<flow-id>`` for deployments where the browser doing the
+    authorizing cannot reach this machine's loopback at all (headless server,
+    user's laptop elsewhere) but a fronting gateway forwards that path to the
+    local listener. Otherwise we default to
+    ``http://<redirect_host>:<port>/callback``. An empty value is treated as
+    unset. Both the client metadata and any pre-registered client info must
+    derive the redirect_uri here so they stay identical — a mismatch makes the
+    authorization server reject the callback.
 
     ``redirect_host`` (default ``127.0.0.1``) tweaks only the hostname of the
     loopback callback. Some providers' WAFs (e.g. Reclaim.ai's AWS API Gateway)
     reject any authorize request whose query string contains a literal
     ``127.0.0.1``, returning ``{"message":"Forbidden"}``; ``redirect_host:
     localhost`` works around that. The callback listener still binds
-    ``127.0.0.1`` either way.
+    ``127.0.0.1`` either way — a public base changes what is *registered*,
+    never where the flow listens.
     """
-    configured = cfg.get("redirect_uri")
-    if configured:
-        return configured
-    host = cfg.get("redirect_host") or "127.0.0.1"
-    return f"http://{host}:{port}/callback"
+    return _redirect_uris(cfg, port)[0]
 
 
 # Figma's remote MCP (https://mcp.figma.com/mcp) implement RFC 7591 DCR as a
@@ -1701,7 +1882,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
         _ensure_sdk_loaded()
     client_name = cfg.get("client_name", "Hermes Agent")
     scope = cfg.get("scope")
-    redirect_uri = _resolve_redirect_uri(cfg, port)
+    redirect_uris = _redirect_uris(cfg, port)
 
     # Default public client; confidential only when a secret is already known
     # or the provider (e.g. Figma) needs confidential-style token posts.
@@ -1711,7 +1892,7 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
 
     metadata_kwargs: dict[str, Any] = {
         "client_name": client_name,
-        "redirect_uris": [AnyUrl(redirect_uri)],
+        "redirect_uris": [AnyUrl(uri) for uri in redirect_uris],
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": auth_method,
@@ -1805,11 +1986,11 @@ def _maybe_preregister_client(
         storage, client_id, cfg.get("client_secret")
     )
     port = cfg["_resolved_port"]
-    redirect_uri = _resolve_redirect_uri(cfg, port)
+    redirect_uris = _redirect_uris(cfg, port)
 
     info_dict: dict[str, Any] = {
         "client_id": client_id,
-        "redirect_uris": [redirect_uri],
+        "redirect_uris": redirect_uris,
         "grant_types": client_metadata.grant_types,
         "response_types": client_metadata.response_types,
         "token_endpoint_auth_method": client_metadata.token_endpoint_auth_method,
@@ -1928,7 +2109,10 @@ def build_oauth_auth(
     # Use closure factories to avoid global state pollution (#44588, #34260).
     resolved_port = cfg.get("_resolved_port", _oauth_port)
     redirect_handler = _make_redirect_handler(
-        resolved_port, redirect_uri=cfg.get("redirect_uri") or None
+        resolved_port,
+        redirect_uri=(
+            cfg.get("redirect_uri") or _public_redirect_uri(cfg) or None
+        ),
     )
     callback_handler = _make_callback_waiter(
         resolved_port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))
