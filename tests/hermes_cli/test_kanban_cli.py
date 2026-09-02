@@ -135,7 +135,12 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db as kb
 
-    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
+    # --force: 'broken-model' is a synthetic assignee, and create now rejects
+    # assignees that match no profile and no board lane. This test is about
+    # reclaim, not about assignee validation.
+    out1 = kc.run_slash(
+        "create 'stuck worker task' --assignee broken-model --force"
+    )
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     tid = m.group(1)
