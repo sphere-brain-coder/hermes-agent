@@ -399,6 +399,10 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Initial card status. Use 'blocked' for cards "
                                "that require immediate human ops (R3 gate) "
                                "to skip the brief running-to-blocked transition.")
+    p_create.add_argument("--force", action="store_true",
+                          help="Skip the create-time assignee check. Use when "
+                               "registering the first card for a new external "
+                               "lane that has no Hermes profile on disk yet.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- swarm ---
@@ -420,6 +424,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_swarm.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_swarm.add_argument("--created-by", default=None, help="Creator/anchor profile")
     p_swarm.add_argument("--idempotency-key", default=None, help="Dedup key for the root card")
+    p_swarm.add_argument("--force", action="store_true",
+                         help="Skip the create-time assignee check on worker, "
+                              "verifier and synthesizer profiles.")
     p_swarm.add_argument("--json", action="store_true", help="Emit JSON output")
 
     # --- list ---
@@ -477,6 +484,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
+    p_assign.add_argument("--force", action="store_true",
+                          help="Skip the assignee check (new external lane).")
 
     # --- set-model (per-task model/provider override) ---
     p_set_model = sub.add_parser(
@@ -1563,6 +1572,26 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         return 2
     with kb.connect_closing() as conn:
+        # Fail fast on card configurations the dispatcher could never spawn.
+        # Both of these used to be written happily and then skipped silently
+        # on every tick, surfacing only via `hermes kanban diagnostics` after
+        # the epic had already stranded. Imported late (like kanban_diagnostics
+        # below) so the module always resolves through sys.modules.
+        from hermes_cli import kanban_spawnability as ksp
+
+        try:
+            ksp.validate_assignee(
+                conn, args.assignee, force=bool(getattr(args, "force", False))
+            )
+            ksp.validate_workspace(
+                ws_kind,
+                ws_path,
+                project_id=getattr(args, "project", None),
+                board_default_workdir=ksp.board_default_workdir(),
+            )
+        except ksp.SpawnabilityError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
         task_id = kb.create_task(
             conn,
             title=args.title,
@@ -1616,7 +1645,21 @@ def _cmd_swarm(args: argparse.Namespace) -> int:
     if not workers:
         print("kanban swarm: at least one --worker is required", file=sys.stderr)
         return 2
+    force = bool(getattr(args, "force", False))
     with kb.connect_closing() as conn:
+        # Validate every profile in the graph BEFORE creating any card. A
+        # swarm is created atomically, so one ghost assignee would otherwise
+        # strand the whole fan-out.
+        from hermes_cli import kanban_spawnability as ksp
+
+        try:
+            for spec in workers:
+                ksp.validate_assignee(conn, spec.profile, force=force)
+            ksp.validate_assignee(conn, args.verifier, force=force)
+            ksp.validate_assignee(conn, args.synthesizer, force=force)
+        except ksp.SpawnabilityError as exc:
+            print(f"kanban swarm: {exc}", file=sys.stderr)
+            return 2
         created = ks.create_swarm(
             conn,
             goal=args.goal,
@@ -1861,6 +1904,15 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
+        from hermes_cli import kanban_spawnability as ksp
+
+        try:
+            ksp.validate_assignee(
+                conn, profile, force=bool(getattr(args, "force", False))
+            )
+        except ksp.SpawnabilityError as exc:
+            print(f"kanban: {exc}", file=sys.stderr)
+            return 2
         ok = kb.assign_task(conn, args.task_id, profile)
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)

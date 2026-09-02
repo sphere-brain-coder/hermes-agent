@@ -400,6 +400,10 @@ def test_create_happy_path(worker_env):
     out = kt._handle_create({
         "title": "child task",
         "assignee": "peer",
+        # force: 'peer' is a synthetic assignee. kanban_create now rejects an
+        # assignee that matches no profile and no board lane; these tests are
+        # about auto-subscribe and the worker lifecycle, not validation.
+        "force": True,
         "parents": [worker_env],
     })
     d = json.loads(out)
@@ -510,6 +514,7 @@ def test_worker_lifecycle_through_tools(worker_env):
     child_out = json.loads(kt._handle_create({
         "title": "write integration test",
         "assignee": "qa",
+        "force": True,  # synthetic assignee; see note above
         "parents": [worker_env],
     }))
     assert child_out["ok"]
@@ -853,6 +858,10 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub gateway",
         "assignee": "peer",
+        # force: 'peer' is a synthetic assignee. kanban_create now rejects an
+        # assignee that matches no profile and no board lane; these tests are
+        # about auto-subscribe and the worker lifecycle, not validation.
+        "force": True,
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -887,6 +896,10 @@ def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "auto-sub tui",
         "assignee": "peer",
+        # force: 'peer' is a synthetic assignee. kanban_create now rejects an
+        # assignee that matches no profile and no board lane; these tests are
+        # about auto-subscribe and the worker lifecycle, not validation.
+        "force": True,
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -913,6 +926,10 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     out = kt._handle_create({
         "title": "no sub cli",
         "assignee": "peer",
+        # force: 'peer' is a synthetic assignee. kanban_create now rejects an
+        # assignee that matches no profile and no board lane; these tests are
+        # about auto-subscribe and the worker lifecycle, not validation.
+        "force": True,
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -942,6 +959,10 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     out = kt._handle_create({
         "title": "no sub gated",
         "assignee": "peer",
+        # force: 'peer' is a synthetic assignee. kanban_create now rejects an
+        # assignee that matches no profile and no board lane; these tests are
+        # about auto-subscribe and the worker lifecycle, not validation.
+        "force": True,
     })
     d = json.loads(out)
     assert d["ok"] is True
@@ -969,6 +990,10 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
         "assignee": "peer",
+        # force: 'peer' is a synthetic assignee. kanban_create now rejects an
+        # assignee that matches no profile and no board lane; these tests are
+        # about auto-subscribe and the worker lifecycle, not validation.
+        "force": True,
     })
     d = json.loads(out)
     assert d["ok"] is True, d

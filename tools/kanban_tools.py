@@ -1420,9 +1420,28 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    force, force_bool_error = _parse_bool_arg(args, "force")
+    if force_bool_error:
+        return tool_error(force_bool_error)
     try:
         kb, conn = _connect(board=board)
         try:
+            # Fail fast on a card the dispatcher could never spawn. An
+            # orchestrator fanning out to a profile that doesn't exist in its
+            # lane, or asking for a worktree with nowhere to put it, used to
+            # get a happily-created card that then sat unspawnable forever.
+            from hermes_cli import kanban_spawnability as ksp
+
+            try:
+                ksp.validate_assignee(conn, str(assignee), force=force)
+                ksp.validate_workspace(
+                    str(workspace_kind),
+                    workspace_path,
+                    project_id=project_id,
+                    board_default_workdir=ksp.board_default_workdir(board),
+                )
+            except ksp.SpawnabilityError as exc:
+                return tool_error(f"kanban_create: {exc}")
             # A project link is safe to inherit because ``create_task`` turns
             # it into a fresh per-task worktree. Never inherit the parent's
             # literal workspace kind/path; directory sharing must be explicit.
@@ -2202,6 +2221,16 @@ KANBAN_CREATE_SCHEMA = {
                 "description": (
                     "Absolute path for 'dir' or 'worktree' workspace. "
                     "Relative paths are rejected at dispatch."
+                ),
+            },
+            "force": {
+                "type": "boolean",
+                "description": (
+                    "Skip the create-time assignee check. Creation normally "
+                    "refuses an assignee that matches no profile and no lane "
+                    "on this board, because the dispatcher can never spawn "
+                    "it. Set true only to register the first card for a new "
+                    "external lane."
                 ),
             },
             "project": {
