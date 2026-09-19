@@ -6649,6 +6649,98 @@ def request_review(
     return _ret(True)
 
 
+def review_implementer(
+    conn: sqlite3.Connection, task_id: str
+) -> Optional[str]:
+    """Profile that produced the latest ``review_requested`` handoff.
+
+    This is the authoritative "who wrote the thing under review" answer, and
+    it deliberately does NOT read ``tasks.assignee``: on a handoff with no
+    ``reviewer`` the assignee is still the implementer, which is exactly the
+    value a self-review guard must not trust. Returns ``None`` when the task
+    has never been handed off for review.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    implementer = payload.get("implementer")
+    if not isinstance(implementer, str) or not implementer.strip():
+        return None
+    return _canonical_assignee(implementer)
+
+
+def review_assignee_is_implementer(
+    conn: sqlite3.Connection, task_id: str
+) -> bool:
+    """True when dispatching this review would spawn its own implementer.
+
+    A card that requests review without naming a ``reviewer`` keeps its
+    implementer as ``assignee``, so the review lane would hand the work back
+    to whoever wrote it. Nothing that run can then do is honest: approving is
+    self-review, completing promotes unmerged work, and requesting changes
+    files a routing fault as a code verdict.
+    """
+    implementer = review_implementer(conn, task_id)
+    if implementer is None:
+        return False
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return False
+    assignee = row["assignee"]
+    if not isinstance(assignee, str) or not assignee.strip():
+        return False
+    return _canonical_assignee(assignee) == implementer
+
+
+def _note_review_needs_human(conn: sqlite3.Connection, task_id: str) -> None:
+    """Record once that this card is parked awaiting a human reviewer.
+
+    Emitted at most once per ``review_requested`` handoff: the dispatcher
+    revisits the review lane every tick, and an event per tick would bury the
+    card's real history. A fresh handoff (a new ``review_requested`` event)
+    re-arms it, so a card that cycles through review is surfaced each round.
+    """
+    with write_txn(conn):
+        handoff = conn.execute(
+            "SELECT id FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_requested' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if handoff is None:
+            return
+        already = conn.execute(
+            "SELECT 1 FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_needs_human' AND id > ? "
+            "LIMIT 1",
+            (task_id, int(handoff["id"])),
+        ).fetchone()
+        if already is not None:
+            return
+        _append_event(
+            conn,
+            task_id,
+            "review_needs_human",
+            {
+                "reason": "implementer_is_only_reviewer",
+                "implementer": review_implementer(conn, task_id),
+            },
+        )
+
+
 def request_changes(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8069,6 +8161,13 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    needs_human_reviewer: list[str] = field(default_factory=list)
+    """Review-column task ids left parked because the only candidate reviewer
+    is the card's own implementer (read from the ``review_requested`` run, not
+    from ``assignee``). The card stays in ``review`` and carries a
+    ``review_needs_human`` event so a board operator can assign a real
+    reviewer or review it themselves. NOT a failure and NOT a retry: no
+    dispatcher tick will clear it, only a human will."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -10328,6 +10427,17 @@ def _dispatch_once_locked(
             profile_exists = None  # type: ignore[assignment]
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        # Never hand a card back to the profile that wrote what is under
+        # review. The implementer comes from the run that produced the
+        # review_requested event, NOT from row["assignee"] — on a handoff
+        # with no reviewer the assignee IS the implementer, which is exactly
+        # the fallback that caused the self-review loop. The card stays in
+        # review for a human; no tick will resolve it, so do not re-queue.
+        if review_assignee_is_implementer(conn, row["id"]):
+            result.needs_human_reviewer.append(row["id"])
+            if not dry_run:
+                _note_review_needs_human(conn, row["id"])
             continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)

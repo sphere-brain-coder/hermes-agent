@@ -2687,6 +2687,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "needs_human_reviewer": res.needs_human_reviewer,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2719,6 +2720,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    if res.needs_human_reviewer:
+        print(
+            f"Awaiting a human reviewer (implementer is the only candidate, "
+            f"card stays in review): {', '.join(res.needs_human_reviewer)}"
+        )
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
