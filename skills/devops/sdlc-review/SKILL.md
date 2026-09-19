@@ -54,6 +54,12 @@ This skill is loaded automatically by the review dispatcher. Start with `kanban_
 
 A requested-changes transition returns the task to its original implementer. When that implementer requests review again without naming a reviewer, the persisted reviewer provenance routes the re-review back to the same reviewer profile.
 
+### Never review your own work
+
+If the card under review was implemented by your own profile, stop. Do not approve it, do not complete it, and do not use `kanban_request_changes` to hand it back: that files a routing fault as if it were a code verdict, and the next reader cannot tell the difference. Escalate with `kanban_block(kind="needs_input")` naming the problem, then stop.
+
+The dispatcher now refuses to spawn a card's implementer as its reviewer, so this should not reach you. If it does, `kanban_block` works from a live review claim: a review claim has never forbidden it. A refusal reading "your run N was superseded" means a newer run already holds the card, and the right response is to stop rather than to force some other transition.
+
 ## Review Lenses
 
 Vary how you look at the work on each round instead of repeating the same inspection. Decorrelated lenses catch different defect classes: a cold read of the artifact surfaces design and correctness problems that the implementer's narrative would have framed away, execution surfaces claims that do not reproduce, and a strict contract audit surfaces quiet scope drift. Repeating the round-1 lens on round 3 mostly re-finds what round 1 already found.

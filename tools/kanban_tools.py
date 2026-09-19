@@ -814,6 +814,42 @@ def _handle_complete(args: dict, **kw) -> str:
         return tool_error(f"kanban_complete: {e}")
 
 
+def _block_refusal_detail(kb, conn, tid: str) -> str:
+    """Explain why a block was refused, naming the cause the worker can act on.
+
+    The generic "unknown id or not in running/ready" is true but useless: the
+    common case by far is a SUPERSEDED run — the dispatcher spawned a newer
+    worker on the same card while this process was still thinking — and a
+    worker reading the generic text reasonably concludes that its claim type
+    (e.g. a review claim) forbids blocking at all. Two live runs drew exactly
+    that wrong conclusion and fell back to filing a routing fault as a code
+    verdict. Name the superseding run instead, and say plainly that stopping
+    is the correct response.
+    """
+    try:
+        task = kb.get_task(conn, tid)
+    except Exception:
+        task = None
+    if task is None:
+        return f"could not block {tid}: no such task on this board"
+    mine = _worker_run_id(tid)
+    current = task.current_run_id
+    if mine is not None and current is not None and int(current) != int(mine):
+        return (
+            f"could not block {tid}: your run {mine} was superseded — run "
+            f"{current} now holds this task (status {task.status!r}). This is "
+            f"not a card-state problem and not something to retry: the board "
+            f"has moved on, so stop and let the current run finish. Use "
+            f"kanban_comment if you have findings worth leaving behind."
+        )
+    return (
+        f"could not block {tid}: the task is {task.status!r}, and block only "
+        f"applies to a task you currently hold (running or ready). A review "
+        f"claim does NOT forbid blocking — a reviewer holding a live claim "
+        f"can always park a card with kanban_block."
+    )
+
+
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
     delegated_err = _reject_delegated_child_mutation("kanban_block")
@@ -872,10 +908,7 @@ def _handle_block(args: dict, **kw) -> str:
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
-                return tool_error(
-                    f"could not block {tid} (unknown id or not in "
-                    f"running/ready)"
-                )
+                return tool_error(_block_refusal_detail(kb, conn, tid))
             run = kb.latest_run(conn, tid)
             # Tell the worker where the task actually landed so it doesn't
             # assume it's sitting in 'blocked' when routing sent it elsewhere.
