@@ -103,6 +103,33 @@ class _ProviderEntry:
 # ---------------------------------------------------------------------------
 
 
+def _normalize_root_issuer(url: str) -> str:
+    """Drop the bare trailing slash from a *root* issuer identifier.
+
+    RFC 8414 section 3.3 compares issuers as exact strings, and the SDK's
+    ``validate_metadata_issuer`` enforces that. Some providers advertise the
+    same authorization server two different ways: Google's protected-resource
+    metadata lists ``https://accounts.google.com/`` while its
+    authorization-server metadata names the issuer
+    ``https://accounts.google.com``. The two name one server — the SDK's own
+    ``issuers_match`` helper says so — but the strict comparison rejects the
+    pair and the whole flow aborts.
+
+    Normalising only the root form (``scheme://authority/`` to
+    ``scheme://authority``) keeps the check meaningful: a different host, or
+    an issuer carrying a path, is left exactly as advertised.
+    """
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(url)
+    except ValueError:  # pragma: no cover — malformed URL
+        return url
+    if parsed.path != "/" or parsed.query or parsed.fragment:
+        return url
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
 def _make_hermes_provider_class() -> Optional[type]:
     """Lazy-import the SDK base class and return our subclass.
 
@@ -500,6 +527,159 @@ def _make_hermes_provider_class() -> Optional[type]:
                     "MCP OAuth '%s': invalid_client detection failed (non-fatal): %s",
                     self._hermes_server_name, exc,
                 )
+
+        def _select_authorization_server(self, advertised: list[str]) -> str:
+            """Pick the authorization server, normalising a root trailing slash.
+
+            See :func:`_normalize_root_issuer`. The SDK stores this value as
+            ``context.auth_server_url`` and later compares it, as an exact
+            string, against the ``issuer`` in the authorization server's own
+            metadata. Google advertises the slashed form in protected-resource
+            metadata and the unslashed form as its issuer, so without this the
+            flow dies at ``validate_metadata_issuer``.
+
+            Discovery URLs are unaffected: the SDK builds them from the
+            origin, which both forms share.
+            """
+            return _normalize_root_issuer(super()._select_authorization_server(advertised))
+
+        async def authorize_now(self) -> bool:
+            """Run the full OAuth flow now, without waiting for a 401.
+
+            The SDK only authorizes reactively: its ``_auth_flow`` runs
+            discovery, registration and the browser round-trip inside the
+            ``response.status_code == 401`` branch. A resource server that
+            answers unauthenticated requests with 200 therefore never triggers
+            it. Google's hosted MCP servers do exactly that — ``initialize``
+            and ``tools/list`` succeed with no credential, and only a real
+            tool call 401s — so ``hermes mcp login`` used to connect, list
+            tools, and exit without ever printing an authorize URL.
+
+            This drives the same steps the SDK's 401 branch would, in the same
+            order, using the SDK's own helpers: PRM discovery (including the
+            RFC 9728 path-suffixed location Google publishes), ASM discovery,
+            scope selection from the resource's metadata, then authorization
+            and token exchange. Returns True when a token was stored.
+
+            Raises:
+                OAuthFlowError: discovery failed, or the provider offers no way
+                    to obtain a client (no ``registration_endpoint`` and no
+                    pre-registered ``client_id`` in config).
+            """
+            from mcp.client.auth.exceptions import OAuthFlowError
+            from mcp.client.auth.utils import (
+                build_oauth_authorization_server_metadata_discovery_urls,
+                build_protected_resource_metadata_discovery_urls,
+                create_client_registration_request,
+                create_oauth_metadata_request,
+                get_client_metadata_scopes,
+                handle_auth_metadata_response,
+                handle_protected_resource_response,
+                handle_registration_response,
+                validate_metadata_issuer,
+            )
+            from mcp.client.auth.oauth2 import check_registration_usable
+
+            from tools.mcp_tool import sdk_httpx
+
+            httpx = sdk_httpx()
+            if httpx is None:  # pragma: no cover — SDK import would have failed
+                raise OAuthFlowError("MCP SDK HTTP client unavailable")
+
+            if not self._initialized:
+                await self._initialize()
+
+            server_url = self.context.server_url
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                # Step 1: protected-resource metadata. The path-suffixed
+                # well-known URL comes first (SEP-985), which is the only one
+                # Google serves — its root location 404s.
+                for url in build_protected_resource_metadata_discovery_urls(
+                    None, server_url
+                ):
+                    try:
+                        resp = await client.send(create_oauth_metadata_request(url))
+                    except httpx.HTTPError as exc:
+                        logger.debug(
+                            "MCP OAuth '%s': PRM discovery to %s failed: %s",
+                            self._hermes_server_name, url, exc,
+                        )
+                        continue
+                    prm = await handle_protected_resource_response(resp)
+                    if prm:
+                        await self._validate_resource_match(prm)
+                        self.context.protected_resource_metadata = prm
+                        if prm.authorization_servers:
+                            self.context.auth_server_url = (
+                                self._select_authorization_server(
+                                    [str(u) for u in prm.authorization_servers]
+                                )
+                            )
+                        break
+
+                # Step 2: authorization-server metadata.
+                expected_issuer = self._expected_issuer()
+                for url in build_oauth_authorization_server_metadata_discovery_urls(
+                    self.context.auth_server_url, server_url
+                ):
+                    try:
+                        resp = await client.send(create_oauth_metadata_request(url))
+                    except httpx.HTTPError as exc:
+                        logger.debug(
+                            "MCP OAuth '%s': ASM discovery to %s failed: %s",
+                            self._hermes_server_name, url, exc,
+                        )
+                        continue
+                    ok, asm = await handle_auth_metadata_response(resp)
+                    if not ok:
+                        break
+                    if asm:
+                        validate_metadata_issuer(asm, expected_issuer)
+                        self.context.oauth_metadata = asm
+                        self.context.storage.save_oauth_metadata(asm)
+                        break
+
+                if self.context.oauth_metadata is None:
+                    raise OAuthFlowError(
+                        f"Could not discover OAuth metadata for "
+                        f"'{self._hermes_server_name}' at {server_url}"
+                    )
+
+                # Step 3: scopes, from the resource's own metadata.
+                self.context.client_metadata.scope = get_client_metadata_scopes(
+                    None,
+                    self.context.protected_resource_metadata,
+                    self.context.oauth_metadata,
+                    self.context.client_metadata.grant_types,
+                )
+
+                # Step 4: a client to authorize as.
+                if not self.context.client_info:
+                    if self.context.oauth_metadata.registration_endpoint is None:
+                        raise OAuthFlowError(
+                            f"'{self._hermes_server_name}' uses an authorization "
+                            "server that does not support dynamic client "
+                            "registration, and no OAuth client is configured. "
+                            "Create one with the provider and set oauth.client_id "
+                            "/ oauth.client_secret for this server in config.yaml."
+                        )
+                    reg_request = create_client_registration_request(
+                        self.context.oauth_metadata,
+                        self.context.client_metadata,
+                        self.context.get_authorization_base_url(server_url),
+                    )
+                    client_information = await handle_registration_response(
+                        await client.send(reg_request)
+                    )
+                    check_registration_usable(client_information)
+                    self.context.client_info = client_information
+                    await self.context.storage.set_client_info(client_information)
+
+                # Step 5: authorize in the browser, then exchange the code.
+                token_request = await self._perform_authorization()
+                await self._handle_token_response(await client.send(token_request))
+
+            return self.context.current_tokens is not None
 
         async def async_auth_flow(self, request):  # type: ignore[override]
             # Pre-flow hook: ask the manager to refresh from disk if needed.

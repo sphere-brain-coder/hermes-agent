@@ -401,6 +401,51 @@ def _probe_single_server(
     return tools_found
 
 
+def _force_oauth_authorization(name: str, server_config: dict) -> bool:
+    """Drive the OAuth flow directly, bypassing the 401 challenge.
+
+    The MCP SDK authorizes reactively: its auth flow only runs discovery and
+    the browser round-trip when a request comes back 401. Google's hosted MCP
+    servers (``calendarmcp.googleapis.com``, ``gmailmcp.googleapis.com``)
+    serve ``initialize`` and ``tools/list`` to anonymous callers with HTTP
+    200, so a probe connects, lists tools, and finishes with no token and no
+    authorize URL ever shown.
+
+    Called by :func:`_reauth_oauth_server` when the probe left no token on
+    disk. Returns True when a token was obtained.
+    """
+    from tools.mcp_oauth import force_interactive_oauth
+    from tools.mcp_oauth_manager import get_manager
+    from tools.mcp_tool import _ensure_mcp_loop, _run_on_mcp_loop, _stop_mcp_loop_if_idle
+
+    config = _resolve_mcp_server_config(server_config)
+
+    try:
+        timeout = max(float(config.get("connect_timeout", 0) or 0), 315.0)
+    except (TypeError, ValueError):  # pragma: no cover — defensive
+        timeout = 315.0
+
+    # `hermes mcp login` is explicitly user-initiated even when stdin is not a
+    # TTY (desktop app, agent-spawned terminal), and provider construction
+    # itself refuses to build without that signal — so the force context has
+    # to cover the build, not just the flow.
+    with force_interactive_oauth():
+        provider = get_manager().get_or_build_provider(
+            name, config["url"], config.get("oauth")
+        )
+        if provider is None or not hasattr(provider, "authorize_now"):
+            logger.debug(
+                "MCP OAuth '%s': no provider supporting forced authorization", name
+            )
+            return False
+
+        _ensure_mcp_loop()
+        try:
+            return bool(_run_on_mcp_loop(provider.authorize_now(), timeout=timeout))
+        finally:
+            _stop_mcp_loop_if_idle()
+
+
 def _oauth_tokens_present(name: str) -> bool:
     """Return True if an OAuth token file exists on disk for ``name``.
 
@@ -867,6 +912,23 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         # "Authenticated — N tools" in that case is a false success: every
         # real tool call later hangs until timeout because there's no token.
         # Verify a token actually landed on disk before claiming success.
+        if not _oauth_tokens_present(name):
+            # The probe succeeded without authenticating: this server serves
+            # initialize/tools-list to anonymous callers, so the SDK's
+            # 401-triggered auth flow never ran. Drive authorization directly
+            # before giving up (Google's calendar/gmail MCP servers).
+            _info(
+                "Server answered without authenticating — starting authorization "
+                "directly."
+            )
+            try:
+                _force_oauth_authorization(name, server_config)
+            except Exception as exc:
+                # Fall through to the guidance below — the most common cause
+                # is a provider with no dynamic registration and no configured
+                # client, which that message already explains.
+                _warning(f"Authorization did not complete: {_unwrap_exception_group(exc)}")
+
         if not _oauth_tokens_present(name):
             _warning(
                 "Server responded, but no OAuth token was obtained — "
