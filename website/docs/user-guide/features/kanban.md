@@ -410,9 +410,16 @@ protocol. If the worker process exits with status 0 while the task is still
 synthetic nudges when it detects the model is about to stop without a terminal
 board tool call. This catches the common case where the model narrates the next
 step ("Let me write the report") and stops with `finish_reason=stop`. The nudge
-reminds the model to call `kanban_complete` or `kanban_block` immediately. This
-guard is active only for dispatcher-spawned workers (`HERMES_KANBAN_TASK` is
-set) and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
+lists every terminal transition (`kanban_complete`, `kanban_block`,
+`kanban_request_review`, `kanban_request_changes`) and asks the model to pick
+the one that is true. It is suppressed as soon as this worker's own run is
+closed in the DB (the run's `outcome` is non-null), so a reviewer that ended on
+`kanban_request_changes` is never nagged to "complete" the work it just
+rejected. The check keys off the run's `outcome`, not `tasks.status`: after a
+terminal review transition the card is already `ready` and owned by someone
+else. This guard is active only for dispatcher-spawned workers
+(`HERMES_KANBAN_TASK` is set) and can be disabled with
+`HERMES_KANBAN_STOP_NUDGE=0`.
 
 **Dispatcher-side recovery:** If the nudges are exhausted or the worker crashes
 before reaching the nudge, the dispatcher gives the violation a **bounded retry**
