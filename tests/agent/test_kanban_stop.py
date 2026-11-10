@@ -210,6 +210,116 @@ def test_closed_run_of_another_task_does_not_suppress(clear_kanban_env, tmp_path
     assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
 
 
+# ── The dispatcher race: tasks.status is running for SOMEONE ELSE ────
+# A hand-built table cannot show this, because the bug only appears once
+# the dispatcher has claimed the NEXT run while the previous worker's turn
+# is still unwinding. These drive the real lifecycle functions instead.
+
+
+def _board(tmp_path, monkeypatch):
+    """A real kanban board, built by the real lifecycle code."""
+    from hermes_cli import kanban_db as kb
+
+    for var in ("HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    kb._INITIALIZED_PATHS.clear()
+    db = tmp_path / "kanban.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db))
+    return kb, kb.connect(db_path=db), db
+
+
+def _through_changes_requested(kb, conn, *, respawn):
+    """review_requested -> changes_requested, optionally respawning the next run.
+
+    Returns (task_id, reviewer_run_id). With ``respawn`` the dispatcher has
+    already claimed a new run under the implementer, so ``tasks.status`` is
+    legitimately ``running`` again for a different worker.
+    """
+    tid = kb.create_task(conn, title="race", assignee="coder")
+    impl = kb.claim_task(conn, tid, claimer="coder:1")
+    assert kb.request_review(
+        conn, tid, summary="done", reviewer="reviewer",
+        expected_run_id=impl.current_run_id,
+    )
+    rev = kb.claim_review_task(conn, tid, claimer="reviewer:1")
+    reviewer_run = rev.current_run_id
+    ok, _ = kb.request_changes(
+        conn, tid, reason="defect on line 147", expected_run_id=reviewer_run,
+    )
+    assert ok
+    if respawn:
+        nxt = kb.claim_task(conn, tid, claimer="coder:2")
+        assert nxt is not None and nxt.current_run_id != reviewer_run
+    return tid, reviewer_run
+
+
+def test_reviewer_not_nudged_once_next_run_is_live(clear_kanban_env, tmp_path, monkeypatch):
+    """The reported race: the card is `running` again under another profile.
+
+    The reviewer's own run is closed, but the dispatcher has already spawned
+    the implementer's next run. Keying off ``tasks.status`` sees ``running``
+    and nudges; keying off this worker's own run sees ``changes_requested``
+    and stays quiet. Complying would complete someone else's live run and
+    approve the work the reviewer just rejected.
+    """
+    kb, conn, db = _board(tmp_path, monkeypatch)
+    tid, reviewer_run = _through_changes_requested(kb, conn, respawn=True)
+    task = kb.get_task(conn, tid)
+    conn.close()
+
+    # Precondition: the task row says running, for a run that is not ours.
+    assert task.status == "running"
+    assert task.current_run_id != reviewer_run
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", tid)
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", str(reviewer_run))
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db))
+    assert current_run_is_terminal() is True
+    assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is None
+
+
+def test_implementer_not_nudged_once_reviewer_run_is_live(clear_kanban_env, tmp_path, monkeypatch):
+    """Same race on the handoff side: request_review, reviewer already claimed."""
+    kb, conn, db = _board(tmp_path, monkeypatch)
+    tid = kb.create_task(conn, title="handoff", assignee="coder")
+    impl = kb.claim_task(conn, tid, claimer="coder:1")
+    impl_run = impl.current_run_id
+    assert kb.request_review(
+        conn, tid, summary="done", reviewer="reviewer",
+        expected_run_id=impl_run,
+    )
+    kb.claim_review_task(conn, tid, claimer="reviewer:1")
+    task = kb.get_task(conn, tid)
+    conn.close()
+
+    assert task.status == "running" and task.current_run_id != impl_run
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", tid)
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", str(impl_run))
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db))
+    assert current_run_is_terminal() is True
+    assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is None
+
+
+def test_live_run_on_real_board_still_nudges(clear_kanban_env, tmp_path, monkeypatch):
+    """Control on the same real board: an open run of our own must nudge.
+
+    Without this, the two tests above could be satisfied by a guard that
+    never fires at all.
+    """
+    kb, conn, db = _board(tmp_path, monkeypatch)
+    tid = kb.create_task(conn, title="working", assignee="coder")
+    mine = kb.claim_task(conn, tid, claimer="coder:1")
+    conn.close()
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", tid)
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", str(mine.current_run_id))
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db))
+    assert current_run_is_terminal() is False
+    assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
+
+
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side
