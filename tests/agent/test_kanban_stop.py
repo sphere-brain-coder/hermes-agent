@@ -189,6 +189,43 @@ def test_unreadable_db_is_unknown_not_terminal(clear_kanban_env, tmp_path):
     assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
 
 
+def test_corrupt_db_fails_open_and_still_nudges(clear_kanban_env, tmp_path):
+    """A DB that exists but cannot be queried must leave the guard ARMED.
+
+    Distinct from the missing-file case above, which returns early on the
+    ``os.path.exists`` check and never reaches the query. This one drives the
+    ``except`` branch: the file is present, so the lookup is attempted and
+    raises. If that branch ever returned "terminal" instead of "unknown", an
+    unreadable board would silence the guard for every worker on the box and
+    real protocol violations would exit unnoticed.
+    """
+    db = tmp_path / "kanban.db"
+    db.write_bytes(b"this is not a sqlite database, not even close")
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "7")
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db))
+    assert current_run_is_terminal() is None
+    assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
+
+
+def test_schema_without_task_runs_is_unknown(clear_kanban_env, tmp_path):
+    """An older board schema is 'unknown', never 'terminal'.
+
+    Also an ``except`` path (no such table), and the one a version skew
+    between dispatcher and worker would actually hit.
+    """
+    db = tmp_path / "kanban.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+    conn.commit()
+    conn.close()
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", "7")
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db))
+    assert current_run_is_terminal() is None
+    assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
+
+
 def test_closed_run_of_another_task_does_not_suppress(clear_kanban_env, tmp_path):
     """A stale RUN_ID from a DIFFERENT task must never silence the guard.
 
