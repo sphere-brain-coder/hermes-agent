@@ -66,9 +66,19 @@ GOOGLE_ASM = {
     "authorization_response_iss_parameter_supported": True,
 }
 
+# Google publishes neither of these, so the branches below are exercised with
+# authorization servers that do.
+REGISTERING_ASM = {**GOOGLE_ASM, "registration_endpoint": "https://accounts.google.com/register"}
+CIMD_ASM = {**GOOGLE_ASM, "client_id_metadata_document_supported": True}
 
-def _google_transport(token_payload: dict | None = None) -> httpx2.MockTransport:
+CIMD_URL = "https://nousresearch.github.io/hermes-agent/docs/oauth/client-metadata.json"
+
+
+def _google_transport(
+    token_payload: dict | None = None, *, asm: dict | None = None
+) -> httpx2.MockTransport:
     """Mock transport mirroring Google's real responses, including the 404s."""
+    asm = asm if asm is not None else GOOGLE_ASM
     token_payload = token_payload or {
         "access_token": "GOOGLE_ACCESS",
         "token_type": "Bearer",
@@ -84,7 +94,16 @@ def _google_transport(token_payload: dict | None = None) -> httpx2.MockTransport
         if url.endswith("/.well-known/oauth-protected-resource"):
             return httpx2.Response(404, text="not found")
         if url.endswith("/.well-known/oauth-authorization-server"):
-            return httpx2.Response(200, json=GOOGLE_ASM)
+            return httpx2.Response(200, json=asm)
+        if url == "https://accounts.google.com/register":
+            return httpx2.Response(
+                201,
+                json={
+                    "client_id": "dynamically-registered",
+                    "client_secret": "dcr-secret",
+                    "redirect_uris": ["http://127.0.0.1:41234/callback"],
+                },
+            )
         if url == "https://oauth2.googleapis.com/token":
             return httpx2.Response(200, json=token_payload)
         return httpx2.Response(404, text=f"unexpected {url}")
@@ -124,7 +143,13 @@ def _preregistered_client_file(token_dir, name: str) -> None:
     )
 
 
-def _build_provider(server_name: str, *, captured: dict):
+def _build_provider(
+    server_name: str,
+    *,
+    captured: dict,
+    scope: str | None = None,
+    client_metadata_url: str | None = None,
+):
     """Build the production provider class with capturing OAuth handlers."""
     from mcp.shared.auth import AuthorizationCodeResult, OAuthClientMetadata
 
@@ -141,23 +166,29 @@ def _build_provider(server_name: str, *, captured: dict):
             iss="https://accounts.google.com",
         )
 
-    client_metadata = OAuthClientMetadata.model_validate(
-        {
-            "client_name": "Hermes Agent",
-            "redirect_uris": ["http://127.0.0.1:41234/callback"],
-            "grant_types": ["authorization_code", "refresh_token"],
-            "response_types": ["code"],
-            "token_endpoint_auth_method": "client_secret_post",
-        }
-    )
+    metadata: dict = {
+        "client_name": "Hermes Agent",
+        "redirect_uris": ["http://127.0.0.1:41234/callback"],
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "client_secret_post",
+    }
+    if scope is not None:
+        # What `oauth.scope` in config.yaml produces (tools.mcp_oauth.
+        # _build_client_metadata puts it here).
+        metadata["scope"] = scope
+    extra = {}
+    if client_metadata_url is not None:
+        extra["client_metadata_url"] = client_metadata_url
     return _HERMES_PROVIDER_CLS(
         server_url=SERVER_URL,
-        client_metadata=client_metadata,
+        client_metadata=OAuthClientMetadata.model_validate(metadata),
         storage=HermesTokenStorage(server_name),
         redirect_handler=redirect_handler,
         callback_handler=callback_handler,
         server_name=server_name,
         preregistered=True,
+        **extra,
     )
 
 
@@ -258,6 +289,95 @@ class TestAuthorizeWithoutChallenge:
         assert params["scope"][0].split() == GOOGLE_PRM["scopes_supported"]
         assert params["client_id"][0] == "test-client.apps.googleusercontent.com"
         assert params["code_challenge_method"][0] == "S256"
+
+    @pytest.mark.asyncio
+    async def test_a_configured_scope_narrows_the_request(self, tmp_path, monkeypatch):
+        """`oauth.scope` must win over the resource's advertised set.
+
+        config.yaml documents `oauth.scope` as "default: server-provided", so
+        a configured value replaces that default. It is the only way to
+        request *fewer* scopes than the resource advertises — the gmail entry
+        narrowing away from `gmail.send` is exactly that case. Without this,
+        the configured value is silently discarded and consent still asks for
+        send.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        _preregistered_client_file(tmp_path / "mcp-tokens", "calendar")
+
+        narrowed = "https://www.googleapis.com/auth/calendar.readonly"
+        captured: dict = {}
+        provider = _build_provider("calendar", captured=captured, scope=narrowed)
+
+        with patch(
+            "tools.mcp_tool.sdk_httpx",
+            return_value=_fake_sdk_httpx(_google_transport()),
+        ):
+            await provider.authorize_now()
+
+        from urllib.parse import parse_qs, urlparse
+
+        requested = parse_qs(urlparse(captured["authorize_url"]).query)["scope"][0]
+        assert requested.split() == [narrowed]
+        # The broader scope the resource advertises must not sneak back in.
+        assert "https://www.googleapis.com/auth/calendar" not in requested.split()
+
+    @pytest.mark.asyncio
+    async def test_a_client_id_metadata_document_is_used_when_supported(
+        self, tmp_path, monkeypatch
+    ):
+        """CIMD before DCR, as in the SDK's 401 branch.
+
+        CIMD is Hermes' default for any server with no pinned client, and an
+        authorization server can advertise it while publishing no
+        `registration_endpoint`. Going straight to registration would both
+        fail that flow and tell the user to create an OAuth client they do
+        not need.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mcp-tokens").mkdir(parents=True, exist_ok=True)
+
+        provider = _build_provider(
+            "calendar", captured={}, client_metadata_url=CIMD_URL
+        )
+
+        with patch(
+            "tools.mcp_tool.sdk_httpx",
+            return_value=_fake_sdk_httpx(_google_transport(asm=CIMD_ASM)),
+        ):
+            ok = await provider.authorize_now()
+
+        assert ok is True
+        assert provider.context.client_info.client_id == CIMD_URL
+
+    @pytest.mark.asyncio
+    async def test_dynamic_registration_binds_credentials_to_the_issuer(
+        self, tmp_path, monkeypatch
+    ):
+        """SEP-2352: registered credentials record the issuer they belong to.
+
+        `credentials_match_issuer` treats a null issuer as "no binding to
+        enforce", so leaving it unset would let credentials registered here be
+        presented to a different authorization server later.
+        """
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "mcp-tokens").mkdir(parents=True, exist_ok=True)
+
+        provider = _build_provider("calendar", captured={})
+
+        with patch(
+            "tools.mcp_tool.sdk_httpx",
+            return_value=_fake_sdk_httpx(_google_transport(asm=REGISTERING_ASM)),
+        ):
+            ok = await provider.authorize_now()
+
+        assert ok is True
+        assert provider.context.client_info.client_id == "dynamically-registered"
+        assert provider.context.client_info.issuer == "https://accounts.google.com"
+
+        on_disk = json.loads(
+            (tmp_path / "mcp-tokens" / "calendar.client.json").read_text()
+        )
+        assert on_disk["issuer"] == "https://accounts.google.com"
 
     @pytest.mark.asyncio
     async def test_authorize_now_explains_a_missing_oauth_client(

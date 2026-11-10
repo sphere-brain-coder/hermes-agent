@@ -176,6 +176,14 @@ def _make_hermes_provider_class() -> Optional[type]:
             # oauth.user_agent — stamped onto token-endpoint requests only;
             # some authorization servers/WAFs reject httpx's default (#75576).
             self._hermes_token_user_agent = token_user_agent
+            # `oauth.scope` from config.yaml, captured before any flow can
+            # overwrite `client_metadata.scope` with a server-advertised set.
+            # Documented as "default: server-provided", i.e. a configured
+            # value is meant to replace the default, which is the only way to
+            # request *fewer* scopes than the resource advertises.
+            self._hermes_configured_scope = getattr(
+                self.context.client_metadata, "scope", None
+            )
 
         def _stamp_token_user_agent(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
@@ -558,24 +566,28 @@ def _make_hermes_provider_class() -> Optional[type]:
             This drives the same steps the SDK's 401 branch would, in the same
             order, using the SDK's own helpers: PRM discovery (including the
             RFC 9728 path-suffixed location Google publishes), ASM discovery,
-            scope selection from the resource's metadata, then authorization
-            and token exchange. Returns True when a token was stored.
+            scope selection (a configured ``oauth.scope`` taking the place of
+            the challenge's), a client ID metadata document or dynamic client
+            registration, then authorization and token exchange. Returns True
+            when a token was stored.
 
             Raises:
                 OAuthFlowError: discovery failed, or the provider offers no way
-                    to obtain a client (no ``registration_endpoint`` and no
-                    pre-registered ``client_id`` in config).
+                    to obtain a client (no CIMD, no ``registration_endpoint``
+                    and no pre-registered ``client_id`` in config).
             """
             from mcp.client.auth.exceptions import OAuthFlowError
             from mcp.client.auth.utils import (
                 build_oauth_authorization_server_metadata_discovery_urls,
                 build_protected_resource_metadata_discovery_urls,
+                create_client_info_from_metadata_url,
                 create_client_registration_request,
                 create_oauth_metadata_request,
                 get_client_metadata_scopes,
                 handle_auth_metadata_response,
                 handle_protected_resource_response,
                 handle_registration_response,
+                should_use_client_metadata_url,
                 validate_metadata_issuer,
             )
             from mcp.client.auth.oauth2 import check_registration_usable
@@ -645,33 +657,74 @@ def _make_hermes_provider_class() -> Optional[type]:
                         f"'{self._hermes_server_name}' at {server_url}"
                     )
 
-                # Step 3: scopes, from the resource's own metadata.
+                # Step 3: scopes. A configured ``oauth.scope`` is fed in at the
+                # helper's highest-priority slot — the one the 401 branch fills
+                # from the WWW-Authenticate challenge, which does not exist
+                # here. That keeps config.yaml's documented meaning ("default:
+                # server-provided", so a configured value replaces it) and is
+                # the only way to request *fewer* scopes than the resource
+                # advertises, which is what narrowing gmail away from
+                # ``gmail.send`` needs. Unconfigured is ``None``, so the
+                # resource-advertised set is still the default. SEP-2207's
+                # ``offline_access`` augmentation applies either way.
                 self.context.client_metadata.scope = get_client_metadata_scopes(
-                    None,
+                    self._hermes_configured_scope,
                     self.context.protected_resource_metadata,
                     self.context.oauth_metadata,
                     self.context.client_metadata.grant_types,
                 )
 
-                # Step 4: a client to authorize as.
+                # Step 4: a client to authorize as. Same order as the SDK's
+                # 401 branch: a client ID metadata document when the server
+                # advertises support for one, dynamic registration otherwise.
                 if not self.context.client_info:
-                    if self.context.oauth_metadata.registration_endpoint is None:
-                        raise OAuthFlowError(
-                            f"'{self._hermes_server_name}' uses an authorization "
-                            "server that does not support dynamic client "
-                            "registration, and no OAuth client is configured. "
-                            "Create one with the provider and set oauth.client_id "
-                            "/ oauth.client_secret for this server in config.yaml."
+                    # SEP-2352: the issuer these credentials get bound to.
+                    discovered_issuer = self._expected_issuer()
+
+                    if should_use_client_metadata_url(
+                        self.context.oauth_metadata, self.context.client_metadata_url
+                    ):
+                        # CIMD records are portable across authorization
+                        # servers, so the issuer stamp is informational.
+                        logger.debug(
+                            "MCP OAuth '%s': using URL-based client ID (CIMD): %s",
+                            self._hermes_server_name, self.context.client_metadata_url,
                         )
-                    reg_request = create_client_registration_request(
-                        self.context.oauth_metadata,
-                        self.context.client_metadata,
-                        self.context.get_authorization_base_url(server_url),
-                    )
-                    client_information = await handle_registration_response(
-                        await client.send(reg_request)
-                    )
-                    check_registration_usable(client_information)
+                        client_information = create_client_info_from_metadata_url(
+                            self.context.client_metadata_url,  # type: ignore[arg-type]
+                            redirect_uris=self.context.client_metadata.redirect_uris,
+                        )
+                        client_information.issuer = discovered_issuer
+                    else:
+                        if self.context.oauth_metadata.registration_endpoint is None:
+                            raise OAuthFlowError(
+                                f"'{self._hermes_server_name}' uses an authorization "
+                                "server that does not support dynamic client "
+                                "registration, and no OAuth client is configured. "
+                                "Create one with the provider and set oauth.client_id "
+                                "/ oauth.client_secret for this server in config.yaml."
+                            )
+                        fallback_base = self.context.get_authorization_base_url(
+                            server_url
+                        )
+                        reg_request = create_client_registration_request(
+                            self.context.oauth_metadata,
+                            self.context.client_metadata,
+                            fallback_base,
+                        )
+                        client_information = await handle_registration_response(
+                            await client.send(reg_request)
+                        )
+                        check_registration_usable(client_information)
+                        # SEP-2352: bind the credentials to the issuer they
+                        # were registered with, so they can never be presented
+                        # to a different authorization server later. Safe to
+                        # stamp unconditionally here: the registration above
+                        # went to the discovered AS's own published
+                        # ``registration_endpoint`` (the None case raised), so
+                        # the binding is one that really was established.
+                        client_information.issuer = discovered_issuer
+
                     self.context.client_info = client_information
                     await self.context.storage.set_client_info(client_information)
 
