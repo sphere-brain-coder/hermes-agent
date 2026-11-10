@@ -47,22 +47,40 @@ without being told and without reading config (`A1`).
 
 ### 3.2 The containment rule
 
-Resolving a target is four steps, and all four must pass:
+Resolving a target reuses the existing resolver rather than hand-rolling a
+second one, and then applies a containment check on the result:
 
 ```python
 canon  = profiles_mod.normalize_profile_name(name)   # 'Coder' -> 'coder'
 profiles_mod.validate_profile_name(canon)            # rejects '..', '/', spaces
 root   = get_default_hermes_root().resolve()
-target = (root / "profiles" / canon).resolve()
-if target.parent != (root / "profiles").resolve():
+target = profiles_mod.get_profile_dir(canon).resolve()
+if canon == "default":
+    # The tier-root lane lives AT <root>, not <root>/profiles/default.
+    if target != root:
+        raise ValueError("default lane did not resolve to this root")
+elif target.parent != (root / "profiles").resolve():
     raise ValueError("target escapes this HERMES_HOME root")
+if not target.is_dir():
+    raise FileNotFoundError(f"no such profile: {canon}")
 ```
 
-The post-resolution parent check is the load-bearing line. Name validation alone
-is a denylist; comparing the resolved parent is a containment check, so a
-symlinked profile directory pointing at another tier fails it too. `A3` exercises
-`../../other-tier/profiles/ceo`, an absolute path, `../paris` and a name with a
-space, and all four are refused.
+The post-resolution check is the load-bearing part. Name validation alone is a
+denylist; comparing the resolved path against the root is a containment check,
+so a symlinked profile directory pointing at another tier fails it too. `A3`
+exercises `../../other-tier/profiles/ceo`, an absolute path, `../paris` and a
+name with a space, and all four are refused; `A5` plants a real cross-tier
+symlink at `<root>/profiles/ceo` and confirms it is refused after resolution
+even though the picker lists it.
+
+The `default` branch is not cosmetic. `get_profile_dir` already special-cases
+`default` to the root home, and the tier-root lane exists in every deployment.
+An earlier draft of this section resolved `<root>/profiles/<name>` directly,
+which made `default` permanently unreachable (`FileNotFoundError`) while the
+picker still offered it: a broken menu entry in every install. Reusing
+`get_profile_dir` is also why there is one resolver in the tree and not two
+that can drift (`A2` asserts every name the picker offers resolves).
+
 
 ### 3.3 Where the trust actually sits
 
@@ -82,10 +100,13 @@ already built.
 
 1. The user types `/handoff` in a dashboard chat (or picks **Hand off thread**
    from the session menu).
-2. Hermes resolves candidate targets: sibling profiles under this root, minus
-   the current one, minus any lane the root policy excludes as a source
+2. Hermes resolves candidate targets: `list_profile_names()` under this root,
+   minus the current one, minus any lane the root policy excludes as a source
    (§8), each with its `profile.yaml` description so the user picks a role and
-   not a directory name (`A2`).
+   not a directory name (`A2`). The list includes `default`, the tier-root
+   lane, which resolves to `<root>` and not to `<root>/profiles/default`
+   (§3.2); it is shown under its configured description rather than the bare
+   word "default", which names a directory and not a role.
 3. The user picks a target and a mode:
    - **summary** (default): an auxiliary-model summary of the thread;
    - **transcript**: the last N turns verbatim, N capped (§6.3).
@@ -213,17 +234,62 @@ context bomb in the receiving lane.
 
 The source thread gets a visible row:
 
-> Handed this thread to **coder** as a summary (812 chars) at 14:03.
+> [System note: this thread was handed to the **coder** lane as a summary
+> (812 chars) at 14:03, at the user's request.]
 > [show what was sent]
 
-It is a real message row with `display_kind="profile_handoff"`, which is the
-existing presentation sidecar (`model_switch`, `internal_notification`,
-`async_delegation_complete` all use it). `C1` persists such a row, reads it back
-verbatim, and shows the sidecar strips cleanly from the model-facing payload, so
-the note is visible to the human and cache-neutral for the model.
+It is a real message row with `role="user"`, `display_kind="profile_handoff"`.
+That is the existing shape for timeline markers (`model_switch`,
+`personality_switch`, `async_delegation_complete`), and the honest description
+of what `display_kind` buys is narrower than it sounds:
 
-"[show what was sent]" expands the stored payload inline. A record of a handover
-that does not show what was handed over is not a record.
+**The note's text does reach the model. `display_kind` does not hide it.**
+`conversation_loop.py:2185` pops the `display_kind` *key* from each outgoing
+copy, so the field never reaches a provider that would reject it. The row's
+`content` is sent like any other turn. `C1` asserts this against the real
+projection (`get_resume_conversations`), not against a dict the check built
+itself, and prints the model-facing history so a reviewer can see the note in
+it. An earlier draft of this section claimed the note was "presentation-only
+and cache-neutral". It is neither, and the claim is withdrawn.
+
+What `display_kind` actually does here is keep the row out of the
+`truncate_before_user_ordinal` addressing space, so a later rewind does not
+resolve one turn early (the `#82756` reasoning behind the
+`personality_switch` marker). That is worth having, and it is the only thing
+being claimed.
+
+Two consequences, both accepted deliberately:
+
+- **The note costs a turn.** A handoff appends one short user-role row to the
+  context, roughly 30 tokens. Pricing it honestly is better than pretending it
+  is free: the alternative designs below cost more.
+- **Alternation repair can merge it.** When the note lands directly after a
+  user turn with no assistant turn between, `repair_alternation` concatenates
+  the two into one user message (`C1b`). This is why the note is phrased as a
+  bracketed `[System note: …]` and never as first-person text: merged into a
+  user turn, a bare sentence would be indistinguishable from something the user
+  typed. The bracketed form still self-identifies after a merge, and
+  `agent/title_generator.py` already treats a `[System note:` prefix as
+  machine-authored, so a handoff cannot become a session title (`C1c`).
+
+**Rejected: `content=""` plus a sidecar.** The obvious way to keep the text off
+the wire is to store the row with empty content and carry the note in
+`display_metadata`. It does keep the text out of `model_history` — and then
+`repair_empty_non_final_messages` rewrites the empty row to
+`[response interrupted]` on the next send, because an empty non-final
+user/assistant row 400s the Anthropic schema. `C1d` demonstrates the
+substitution. The result is worse than the plain row: the model sees a false
+interruption marker instead of an accurate note. Not done.
+
+**Rejected: no row at all, UI chrome only.** The card asks for a visible note in
+the source thread. A note that exists only in a client's rendering is lost on
+export, on resume in another client, and on `hermes session show`. A durable
+row is the point.
+
+"[show what was sent]" expands the stored payload inline, from the sent file's
+hash-matched copy. A record of a handover that does not show what was handed
+over is not a record.
+
 
 ## 8. Excludable sources
 
@@ -239,8 +305,15 @@ profiles:
     source_excluded: ["ceo-*", "family-office"]
 ```
 
-Shell globs, case-insensitive, matched against the source profile name, same
-matching convention as `kanban.restricted_lane_assignees`.
+Shell globs matched against the source profile name. The matching convention is
+the one already used for tool-name filters in
+`tools/mcp_tool.py:matches_name_filter` (exact names match literally, entries
+containing `*`, `?` or `[` match as `fnmatch` globs, the same semantics as
+`approvals.deny`) and for skill paths in `tools/skills_guard.py`. `C3` exercises
+that real function against `["ceo-*", "family-office"]`. Note that
+`matches_name_filter` is case-*sensitive* (`fnmatchcase`); that is harmless here
+because `normalize_profile_name` has already lowercased the name, but the
+pattern in config must be written lowercase.
 
 Two properties matter more than the syntax:
 
@@ -283,7 +356,7 @@ The ladder in `AGENTS.md` puts new core model tools last. This proposal adds
 | Resolve, scan, write, audit | `hermes_cli/profile_handoff.py` | new module |
 | `/handoff` slash command | TUI slash registry + gateway | existing surface |
 | Inbox drain on session start | `agent/agent_init.py` | one `scandir` |
-| Source-thread note | existing `display_kind` sidecar | zero new surface |
+| Source-thread note | existing `display_kind` row shape | no new surface, one turn of context (§7) |
 | `profiles.handoff.source_excluded` | `hermes_cli/config_defaults.py` | one key |
 
 No new `HERMES_*` env var: the policy is config, not a credential.
@@ -325,3 +398,10 @@ different hat. Not built.
 4. **Multi-target.** Deliberately one target per confirmation. If handing one
    thread to three lanes is a real need, say so now: three confirmations is a
    fine answer, but fan-out-after-one-confirm is not.
+5. **The tier-root lane as a target.** §3.2 now resolves `default` correctly,
+   so the root lane is a legitimate target. Whether it *should* be one is a
+   policy call, not a code call: on Sphere's boxes the root lane is where
+   tier-wide config lives. The mechanism to exclude it already exists
+   (`source_excluded`), but that flag governs sources. If the root lane should
+   not be a *target* either, that is a second, separate list, and it needs
+   deciding before implementation rather than after.
