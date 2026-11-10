@@ -406,15 +406,25 @@ protocol. If the worker process exits with status 0 while the task is still
 `running`, the dispatcher treats that as a protocol violation and emits a
 `protocol_violation` event.
 
-**Agent-side prevention:** Before the worker exits, Hermes injects up to two
-synthetic nudges when it detects the model is about to stop without a terminal
-board tool call. This catches the common case where the model narrates the next
-step ("Let me write the report") and stops with `finish_reason=stop`. The nudge
-reminds the model to call `kanban_complete` or `kanban_block` immediately. This
-guard is active only for dispatcher-spawned workers (`HERMES_KANBAN_TASK` is
-set) and can be disabled with `HERMES_KANBAN_STOP_NUDGE=0`.
+**Agent-side prevention:** Before the worker exits, Hermes injects one synthetic
+nudge when it detects the model is about to stop without a terminal board tool
+call. This catches the common case where the model narrates the next step ("Let
+me write the report") and stops with `finish_reason=stop`. The nudge names every
+transition that ends a run (`kanban_complete`, `kanban_block`,
+`kanban_request_review`, `kanban_request_changes`) and asks for exactly one of
+them. This guard is active only for dispatcher-spawned workers
+(`HERMES_KANBAN_TASK` is set) and can be disabled with
+`HERMES_KANBAN_STOP_NUDGE=0`.
 
-**Dispatcher-side recovery:** If the nudges are exhausted or the worker crashes
+It suppresses itself when the board shows the run already ended: the nudge
+checks `task_runs.outcome` for `HERMES_KANBAN_RUN_ID` (falling back to a null
+`tasks.current_run_id`), not `tasks.status`, so a worker that correctly handed
+off via `kanban_request_review` or `kanban_request_changes` is never told it is
+"still running". The check fails open, so an unreadable board leaves the guard
+armed, and the one-nudge budget means a worker that declines is not re-prompted
+in a loop.
+
+**Dispatcher-side recovery:** If the nudge is spent or the worker crashes
 before reaching the nudge, the dispatcher gives the violation a **bounded retry**
 (up to `_PROTOCOL_VIOLATION_FAILURE_LIMIT` consecutive violations, default 3)
 before auto-blocking the task instead of respawning it into the same loop. The
