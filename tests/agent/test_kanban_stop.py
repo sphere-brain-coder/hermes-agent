@@ -189,6 +189,27 @@ def test_unreadable_db_is_unknown_not_terminal(clear_kanban_env, tmp_path):
     assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
 
 
+def test_closed_run_of_another_task_does_not_suppress(clear_kanban_env, tmp_path):
+    """A stale RUN_ID from a DIFFERENT task must never silence the guard.
+
+    The run row is looked up by (id, task_id), so a closed run belonging to
+    some other card cannot be mistaken for this worker's own finished run.
+    That would be the reported bug inverted, letting a genuine silent exit
+    through.
+    """
+    db, run_id = _worker_db(tmp_path, outcome="completed")
+    conn = sqlite3.connect(db)
+    # This worker is on a different card whose own run is still open.
+    conn.execute("INSERT INTO tasks VALUES ('t_other', 'running', 9)")
+    conn.commit()
+    conn.close()
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_other")
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(db))
+    assert current_run_is_terminal() is None
+    assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
+
+
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side
