@@ -238,6 +238,77 @@ class TestRootIssuerTrailingSlash:
         assert selected == "https://auth.example.com/tenant-a/"
 
 
+class TestWorksOnThePinnedSdk:
+    """The forced path must not need SDK members the pinned version lacks.
+
+    ``_select_authorization_server`` and ``_expected_issuer`` only exist on
+    ``OAuthClientProvider`` from mcp 2.2.0. This repo pins ``mcp==2.0.0``
+    (pyproject, and uv.lock is what CI installs), where calling ``super()``
+    for either raises ``AttributeError`` and the whole forced-authorization
+    path dies before printing an authorize URL.
+
+    These tests delete both members from the base class, so they exercise the
+    pinned-SDK behaviour whatever version is installed. On 2.0.0 the deletes
+    are no-ops and the tests still assert the real code path.
+    """
+
+    @staticmethod
+    def _strip_base_members(monkeypatch):
+        from mcp.client.auth import OAuthClientProvider
+
+        for name in ("_select_authorization_server", "_expected_issuer"):
+            monkeypatch.delattr(OAuthClientProvider, name, raising=False)
+
+    def test_the_overrides_do_not_require_the_newer_sdk(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._strip_base_members(monkeypatch)
+        provider = _build_provider("calendar", captured={})
+
+        selected = provider._select_authorization_server(
+            GOOGLE_PRM["authorization_servers"]
+        )
+        assert selected == "https://accounts.google.com"
+
+        provider.context.auth_server_url = selected
+        assert provider._expected_issuer() == "https://accounts.google.com"
+
+    def test_expected_issuer_falls_back_to_the_resource_origin(
+        self, tmp_path, monkeypatch
+    ):
+        """The legacy no-PRM path: RFC 8414 section 3.3 builds from the origin."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._strip_base_members(monkeypatch)
+        provider = _build_provider("calendar", captured={})
+
+        provider.context.auth_server_url = None
+        # SERVER_URL carries a path; only the origin identifies the issuer,
+        # and it must render without an empty trailing path so the
+        # exact-string comparison in validate_metadata_issuer can succeed.
+        assert provider._expected_issuer() == "https://calendarmcp.googleapis.com"
+
+    @pytest.mark.asyncio
+    async def test_authorize_now_runs_on_the_pinned_sdk(self, tmp_path, monkeypatch):
+        """End to end: an authorize URL and a token, with no 2.2.0 members."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._strip_base_members(monkeypatch)
+        token_dir = tmp_path / "mcp-tokens"
+        _preregistered_client_file(token_dir, "calendar")
+
+        captured: dict = {}
+        provider = _build_provider("calendar", captured=captured)
+        transport = _google_transport()
+
+        with patch(
+            "tools.mcp_tool.sdk_httpx", return_value=_fake_sdk_httpx(transport)
+        ):
+            ok = await provider.authorize_now()
+
+        assert ok is True
+        assert captured["authorize_url"].startswith(
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        )
+
+
 class TestAuthorizeWithoutChallenge:
     """``hermes mcp login`` must work when the server never answers 401."""
 

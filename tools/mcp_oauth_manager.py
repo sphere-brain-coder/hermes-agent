@@ -130,6 +130,48 @@ def _normalize_root_issuer(url: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def _origin_issuer(server_url: str) -> str:
+    """The resource server's origin as an issuer identifier.
+
+    RFC 8414 section 3.3 builds the legacy (no-PRM) well-known URL from the
+    resource server's origin, so that origin is the issuer the returned
+    metadata must name. The string has to render the way
+    ``OAuthMetadata.issuer`` renders a URL — host case folded, default ports
+    dropped, no empty trailing path — or the exact-string comparison fails on
+    a cosmetic difference.
+
+    The SDK grew its own ``_origin_issuer`` in mcp 2.2.0. We prefer it when it
+    is there, so there is exactly one definition in play, and fall back to the
+    same pydantic rendering on the version this repo pins (2.0.0), which has
+    no such helper.
+    """
+    try:
+        from mcp.client.auth.oauth2 import (
+            _origin_issuer as _sdk_origin_issuer,  # type: ignore[unresolved-import]
+        )
+    except (ImportError, AttributeError):
+        pass
+    else:
+        return _sdk_origin_issuer(server_url)
+
+    from urllib.parse import urlsplit
+
+    parsed = urlsplit(server_url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    try:
+        from pydantic import AnyHttpUrl, ConfigDict, TypeAdapter
+
+        adapter = TypeAdapter(
+            AnyHttpUrl, config=ConfigDict(url_preserve_empty_path=True)
+        )
+        return str(adapter.validate_python(origin))
+    except Exception:  # pragma: no cover — pydantic too old for the config key
+        # Without ``url_preserve_empty_path`` pydantic would append a trailing
+        # slash, which is the very mismatch this is meant to avoid. The
+        # unrendered origin is the safer answer.
+        return origin
+
+
 def _make_hermes_provider_class() -> Optional[type]:
     """Lazy-import the SDK base class and return our subclass.
 
@@ -548,8 +590,32 @@ def _make_hermes_provider_class() -> Optional[type]:
 
             Discovery URLs are unaffected: the SDK builds them from the
             origin, which both forms share.
+
+            The base method arrived in mcp 2.2.0; this repo pins 2.0.0, where
+            the 401 branch inlines the same choice (``advertised[0]``). Defer
+            to the SDK when it defines it, otherwise make that choice here, so
+            the override holds on both versions.
             """
-            return _normalize_root_issuer(super()._select_authorization_server(advertised))
+            base = getattr(super(), "_select_authorization_server", None)
+            selected = base(advertised) if base is not None else advertised[0]
+            return _normalize_root_issuer(selected)
+
+        def _expected_issuer(self) -> str:
+            """The issuer that AS metadata and client credentials must match.
+
+            Same version split as ``_select_authorization_server``: the base
+            method exists from mcp 2.2.0, and on 2.0.0 the 401 branch inlines
+            the equivalent (``auth_server_url``, falling back to the resource
+            server's origin on the legacy no-PRM path). Defining it here keeps
+            :meth:`authorize_now` working on the pinned SDK while still
+            deferring to the base where it exists.
+            """
+            base = getattr(super(), "_expected_issuer", None)
+            if base is not None:
+                return base()
+            return self.context.auth_server_url or _origin_issuer(
+                self.context.server_url
+            )
 
         async def authorize_now(self) -> bool:
             """Run the full OAuth flow now, without waiting for a 401.
