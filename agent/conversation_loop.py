@@ -8224,11 +8224,15 @@ def run_conversation(
                     continue
 
                 # ── Kanban worker terminal-tool stop guard ─────────────
-                # Workers must end with kanban_complete / kanban_block.
-                # Models sometimes narrate the next step ("Let me write the
-                # report") and stop with finish_reason=stop — a clean exit
-                # that the dispatcher records as protocol_violation. Nudge
-                # once or twice before allowing that exit.
+                # Workers must end their run with a terminal board call:
+                # kanban_complete / kanban_block / kanban_request_review /
+                # kanban_request_changes. Models sometimes narrate the next
+                # step ("Let me write the report") and stop with
+                # finish_reason=stop, a clean exit that the dispatcher
+                # records as protocol_violation. Nudge once before allowing
+                # that exit. build_kanban_stop_nudge suppresses itself when
+                # the board already recorded an outcome for this run, so a
+                # worker that finished correctly is never re-prompted.
                 try:
                     from agent.kanban_stop import build_kanban_stop_nudge
 
@@ -8259,8 +8263,8 @@ def run_conversation(
                         os.environ.get("HERMES_KANBAN_TASK", ""),
                     )
                     agent._emit_status(
-                        "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block — nudging to finish"
+                        "⚠️ Kanban worker tried to exit without a terminal "
+                        "board call, nudging to finish"
                     )
                     # Same finalizer contract as verify-on-stop: clear
                     # final_response while continuing so a later budget
