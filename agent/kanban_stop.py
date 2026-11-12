@@ -21,7 +21,9 @@ had already finished correctly (three occurrences on ``t_00352f44``):
   A run whose row already carries an ``outcome`` (or a task whose
   ``current_run_id`` no longer points at a live run) cannot be closed again:
   the only tools the nudge could name would be rejected, so it is suppressed.
-  The check reads ``task_runs.outcome``, not ``tasks.status``.
+  The check reads ``task_runs.outcome``, not ``tasks.status``, and only for a
+  run that belongs to this task: a stale run id inherited from an earlier
+  card must never speak for the current one.
 
 The budget is one nudge per run: a worker that correctly declines must not
 be re-prompted in a loop.
@@ -115,11 +117,20 @@ def run_already_terminal(
 
     Decided off the run record, not ``tasks.status``:
 
-    * the run row for ``HERMES_KANBAN_RUN_ID`` has a non-null ``outcome``
-      or ``ended_at`` → terminal;
-    * no run id is known (or its row is gone) and the task's
-      ``current_run_id`` is null → the run this process belonged to is no
-      longer the active one, so nothing is left for it to close.
+    * the run row for ``HERMES_KANBAN_RUN_ID`` **belongs to this task** and
+      has a non-null ``outcome`` or ``ended_at`` → terminal;
+    * no usable run id (unset, unknown to the board, or owned by a
+      different task) and the task's ``current_run_id`` is null → the run
+      this process belonged to is no longer the active one, so nothing is
+      left for it to close.
+
+    The ownership check is load-bearing, not defensive tidying. A worker's
+    environment can name a run from an earlier card (the env is inherited,
+    the board is not), and a *closed* run from another task would otherwise
+    suppress the nudge for a task whose own run is still open — this defect
+    inverted, turning a genuine silent exit into a quiet one. The repo makes
+    the same move in ``tools/kanban_tools.py:_worker_run_id()`` and
+    ``hermes_cli/kanban.py:_worker_run_id_for()``.
 
     Fails open (returns ``False``) whenever the board cannot be read, so a
     missing or locked DB never silences the guard for a genuine violation.
@@ -137,7 +148,9 @@ def run_already_terminal(
         try:
             if rid is not None:
                 run = kb.get_run(conn, rid)
-                if run is not None:
+                # A run that is not this task's says nothing about this task.
+                # Fall through to the pointer check rather than trusting it.
+                if run is not None and run.task_id == tid:
                     return bool(run.outcome) or run.ended_at is not None
             task = kb.get_task(conn, tid)
             if task is None:

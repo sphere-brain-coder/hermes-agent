@@ -198,6 +198,58 @@ def test_no_nudge_when_current_run_pointer_cleared(board, monkeypatch):
     assert build_kanban_stop_nudge(messages=[{"role": "user", "content": "go"}]) is None
 
 
+def test_closed_run_of_another_task_does_not_suppress(board, monkeypatch):
+    """A stale HERMES_KANBAN_RUN_ID from a DIFFERENT card must not suppress.
+
+    Review finding on PR #9: the guard trusted the env run id outright. Task A
+    finishes (its run closes), task B is then claimed with its own OPEN run,
+    but the worker's environment still names A's run. Reading A's closed row
+    and calling it "my run ended" silences the guard for B, which is this
+    defect inverted: a genuine silent exit on B goes un-nudged.
+
+    The run must belong to the task before its outcome counts.
+    """
+    tid_a, run_a = _claimed_task(board, title="other card")
+    conn = board.connect()
+    try:
+        assert board.complete_task(conn, tid_a, summary="done")
+        assert board.get_run(conn, run_a).outcome is not None
+    finally:
+        conn.close()
+
+    tid_b, run_b = _claimed_task(board, title="my card")
+    assert run_b != run_a
+    conn = board.connect()
+    try:
+        # B's own run is open and B still points at it.
+        assert board.get_run(conn, run_b).outcome is None
+        assert board.get_task(conn, tid_b).current_run_id == run_b
+    finally:
+        conn.close()
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid_b)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_a))
+    assert run_already_terminal() is False
+    nudge = build_kanban_stop_nudge(messages=[{"role": "user", "content": "go"}])
+    assert nudge is not None
+    assert tid_b in nudge
+
+
+def test_explicit_run_id_of_another_task_does_not_suppress(board, monkeypatch):
+    """Same ownership rule when the run id is passed in, not read from env."""
+    tid_a, run_a = _claimed_task(board, title="other card, explicit")
+    conn = board.connect()
+    try:
+        assert board.complete_task(conn, tid_a, summary="done")
+    finally:
+        conn.close()
+
+    tid_b, run_b = _claimed_task(board, title="my card, explicit")
+    monkeypatch.delenv("HERMES_KANBAN_RUN_ID", raising=False)
+    assert run_already_terminal(task_id=tid_b, run_id=run_a) is False
+    assert run_already_terminal(task_id=tid_b, run_id=run_b) is False
+
+
 def test_genuine_silent_exit_still_nudged(board, monkeypatch):
     """Acceptance 2: a run that made no board transition still gets the nudge."""
     tid, run_id = _claimed_task(board, title="narrated exit")

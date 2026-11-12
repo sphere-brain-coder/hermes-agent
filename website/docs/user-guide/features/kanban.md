@@ -420,9 +420,11 @@ It suppresses itself when the board shows the run already ended: the nudge
 checks `task_runs.outcome` for `HERMES_KANBAN_RUN_ID` (falling back to a null
 `tasks.current_run_id`), not `tasks.status`, so a worker that correctly handed
 off via `kanban_request_review` or `kanban_request_changes` is never told it is
-"still running". The check fails open, so an unreadable board leaves the guard
-armed, and the one-nudge budget means a worker that declines is not re-prompted
-in a loop.
+"still running". The run id is only trusted when the run belongs to the task
+being nudged, so a stale id inherited from an earlier card cannot silence the
+guard for a task whose own run is still open. The check fails open, so an
+unreadable board leaves the guard armed, and the one-nudge budget means a
+worker that declines is not re-prompted in a loop.
 
 **Dispatcher-side recovery:** If the nudge is spent or the worker crashes
 before reaching the nudge, the dispatcher gives the violation a **bounded retry**
