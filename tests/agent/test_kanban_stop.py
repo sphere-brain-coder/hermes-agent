@@ -320,6 +320,42 @@ def test_live_run_on_real_board_still_nudges(clear_kanban_env, tmp_path, monkeyp
     assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
 
 
+def test_guard_never_creates_a_board_it_cannot_find(
+    clear_kanban_env, tmp_path, monkeypatch
+):
+    """A missing board must be read, not made.
+
+    The guard runs on EVERY turn end, so it has to be read-only. Reaching
+    the board through the initialising connect path instead of a read-only
+    open turns each turn end into a write: pointed at a path with no board
+    (a renamed or archived board, a path this process cannot see) it
+    silently creates a fully-formed empty one, which a later reader can
+    mistake for a real board.
+
+    Keep this keyed on files-on-disk rather than on the return value. The
+    nudge decision is already correct in this state; it is the side effect
+    that is wrong, and nothing else in the suite would notice it.
+    """
+    kb, conn, db = _board(tmp_path / "real", monkeypatch)
+    tid = kb.create_task(conn, title="working", assignee="coder")
+    mine = kb.claim_task(conn, tid, claimer="coder:1")
+    conn.close()
+
+    probe = tmp_path / "probe"
+    probe.mkdir()
+    missing = probe / "kanban.db"
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", tid)
+    clear_kanban_env.setenv("HERMES_KANBAN_RUN_ID", str(mine.current_run_id))
+    clear_kanban_env.setenv("HERMES_KANBAN_DB", str(missing))
+
+    # Fails open: an unreadable board must never silence a genuine violation.
+    assert build_kanban_stop_nudge(messages=_tool_round("kanban_comment")) is not None
+    # ...and leaves nothing behind.
+    assert not missing.exists(), "the guard created a board at a path that had none"
+    assert sorted(p.name for p in probe.iterdir()) == []
+
+
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side
