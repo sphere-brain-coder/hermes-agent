@@ -57,6 +57,7 @@ The repo ships these bundled plugins under `plugins/`. All are opt-in — enable
 |---|---|---|
 | `disk-cleanup` | hooks + slash command | Auto-track ephemeral files and clean them on session end |
 | `security-guidance` | hooks | Pattern-match dangerous code on `write_file`/`patch` and append a security warning (or block) — 25 rules (Apache-2.0 fork of Anthropic's `claude-plugins-official` patterns) |
+| `ai-tell-filter` | hooks | Strip lexical AI tells (em/en dashes, Tier 1A word swaps) from the final response before delivery — deterministic, no extra tokens |
 | `observability/langfuse` | hooks | Trace turns / LLM calls / tools to [Langfuse](https://langfuse.com) |
 | `teams_pipeline` | standalone | Microsoft Teams meeting pipeline — Graph-backed, transcript-first meeting summaries |
 | `spotify` | backend (7 tools) | Native Spotify playback, queue, search, playlists, albums, library |
@@ -138,6 +139,30 @@ The file is still written. The model reads the warning in the next turn's tool m
 **Disabling again:** `hermes plugins disable security-guidance`.
 
 **What it does not do (yet):** the upstream Anthropic plugin has two more layers — an LLM diff review on each agent turn that touched files, and an agentic commit-time review that traces data flow across files. Neither is ported. The agent can already run those reviews on demand via `delegate_task`.
+
+### ai-tell-filter
+
+Strips lexical AI tells from the assistant's final response before delivery, with no inference and no extra tokens. Two substitutions only:
+
+- **Dashes.** Em dash, en dash and horizontal bar used as a prose splice become a comma; an en dash between digits becomes a hyphen (`2020–2024` → `2020-2024`); a dash following a comma, colon or semicolon is dropped rather than doubled. `--` is left alone, since in a coding assistant's output it is a CLI flag far more often than a dash.
+- **Tier 1A word swaps** from the [`avoid-ai-writing`](https://github.com/conorbronsdon/avoid-ai-writing) skill, limited to entries with a safe one-for-one replacement: `robust` → `reliable`, `delve` → `dig`, `seamless` → `smooth`, `leverage` → `use`, `comprehensive` → `thorough`, and about twenty more. Inflections are listed explicitly (`delved` → `dug`, never `digged`) and the original capitalisation is carried over.
+
+**What it deliberately leaves alone:** rhythm, structure, sentence length and paragraph shape. The filter only substitutes — it never deletes a word, reflows a line or re-splits a sentence — because a pass that also flattened rhythm would trade one detectable register for another, which is what the skill's "Never inject" guardrails warn against. Tier 1A entries whose guidance is "rewrite entirely" (`tapestry`, `beacon`, `game-changer`) have no honest 1:1 swap and are left for a human.
+
+**Carve-outs, never touched:** fenced code blocks and their fence lines, inline code spans, URLs (with trailing sentence punctuation handed back to the prose so `[docs](https://x.test)` keeps its paren), file paths and extension-bearing filenames, blockquote lines, markdown table rows, and double-quoted material (straight or curly). The transform is idempotent.
+
+**Modes:**
+
+| Env var | Effect |
+|---|---|
+| unset (default) | filter active on every delivered response |
+| `AI_TELL_FILTER_DISABLE=1` | plugin loads, hook is a no-op — the fastest raw-vs-filtered comparison |
+
+Responses over 200,000 characters pass through untouched; at that size the text is a pasted artifact, not prose.
+
+**Enabling:** `hermes plugins enable ai-tell-filter` (or check the box in `hermes plugins`).
+
+**Disabling again:** `hermes plugins disable ai-tell-filter`.
 
 ### observability/langfuse
 
