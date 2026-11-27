@@ -1,0 +1,6 @@
+name: ai-tell-filter
+version: "0.1.0"
+description: "Strip lexical AI tells from the assistant's final response before delivery. Deterministic and token-free: em/en dash replacement plus Tier 1A word swaps from the avoid-ai-writing skill (robust -> reliable, delve -> dig, seamless -> smooth, ...). Substitution only, so sentence rhythm, structure and line layout are untouched. Code blocks, inline code, URLs, file paths, blockquotes, table rows and quoted material are carved out."
+author: "NousResearch (plugin); word list adapted from the avoid-ai-writing skill by Conor Bronsdon, MIT"
+hooks:
+  - transform_llm_output
