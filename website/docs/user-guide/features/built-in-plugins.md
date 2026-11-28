@@ -149,7 +149,7 @@ Strips lexical AI tells from the assistant's final response before delivery, wit
 
 **What it deliberately leaves alone:** rhythm, structure, sentence length and paragraph shape. The filter only substitutes — it never deletes a word, reflows a line or re-splits a sentence — because a pass that also flattened rhythm would trade one detectable register for another, which is what the skill's "Never inject" guardrails warn against. Tier 1A entries whose guidance is "rewrite entirely" (`tapestry`, `beacon`, `game-changer`) have no honest 1:1 swap and are left for a human.
 
-**Carve-outs, never touched:** fenced code blocks and their fence lines, inline code spans, URLs (with trailing sentence punctuation handed back to the prose so `[docs](https://x.test)` keeps its paren), file paths and extension-bearing filenames, blockquote lines, markdown table rows, and double-quoted material (straight or curly). The transform is idempotent.
+**Carve-outs, never touched:** fenced code blocks and their fence lines (a fence closes only on a run of the same character at least as long as the opener, so a nested shorter fence stays code), indented code blocks (4 spaces or a tab after a blank line), inline code spans, URLs (with trailing sentence punctuation handed back to the prose so `[docs](https://x.test)` keeps its paren), absolute and relative file paths plus extension-bearing filenames, blockquote lines, GFM table rows with or without leading pipes, and double-quoted material (straight or curly). The transform is idempotent.
 
 **Modes:**
 

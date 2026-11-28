@@ -21,9 +21,14 @@ uniform register the skill's "Never inject" guardrails warn about.
 
 Carve-outs, never touched:
 
-* fenced code blocks (``` and ~~~), including the fence lines
-* blockquote lines and markdown table rows
-* inline code spans, URLs, file paths and extension-bearing filenames
+* fenced code blocks, including the fence lines. A fence closes only on a
+  run of the same character at least as long as the opener, so a ``` block
+  nested inside a ```` block stays code.
+* indented code blocks (4 spaces or a tab after a blank line), except
+  where the indentation is a list item's own continuation
+* blockquote lines and GFM table rows, with or without leading pipes
+* inline code spans, URLs, absolute and relative file paths, and
+  extension-bearing filenames
 * double-quoted material, straight or curly
 
 The module is pure text in, text out, with no I/O and no inference, so it
@@ -168,6 +173,12 @@ _PROTECTED_SPANS: Tuple[Tuple[re.Pattern, bool], ...] = (
     (re.compile(r"(?:https?|ftp|file|mailto):\S+"), True),   # URLs
     (re.compile(r"\bwww\.\S+"), True),                       # bare www URLs
     (re.compile(r"(?<![\w.])(?:~|\.{1,2})?/[\w.\-/]*[\w.\-]"), True),  # paths
+    # Bare relative paths: ``src/robust``, ``plugins/core.py``, ``docs/``.
+    # No leading ``/``, ``./`` or ``~``, so the rule above cannot see them,
+    # and the filename rule below rescues only the last extension-bearing
+    # segment. A slash-joined token is a path far more often than it is
+    # prose, and a missed tell is cheaper than a silently mangled path.
+    (re.compile(r"(?<![\w.\-/])(?:[\w.\-]+/)+[\w.\-]*"), True),
     (re.compile(
         r"\b[\w.\-]+\.(?:py|js|mjs|ts|tsx|jsx|md|json|ya?ml|toml|ini|cfg|sh|"
         r"bash|zsh|txt|csv|log|rs|go|java|rb|php|c|h|cc|cpp|hpp|sql|html|css)\b"
@@ -201,9 +212,119 @@ def _split_tail(span: str) -> Tuple[str, str]:
         span = span[:-1]
     return span, tail
 
-_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+_FENCE_RE = re.compile(r"^\s{0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 _BLOCKQUOTE_RE = re.compile(r"^\s{0,3}>")
 _TABLE_ROW_RE = re.compile(r"^\s*\|")
+# An indented code block is 4 spaces or a tab (CommonMark).
+_INDENTED_CODE_RE = re.compile(r"^(?: {4}|\t)")
+# GFM delimiter row: ``--- | ---``, ``| :-- | --: |``. At least one pipe, so
+# a ``---`` horizontal rule never looks like a table.
+_TABLE_DELIM_RE = re.compile(
+    r"^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*$"
+)
+
+
+def _table_row_indices(lines: List[str]) -> set:
+    """Indices of lines belonging to a GFM table block.
+
+    A table is a row containing a pipe followed by a delimiter row, then
+    every consecutive non-blank pipe-bearing line. GFM does not require a
+    leading pipe, so anchoring on ``^|`` alone leaves most real tables
+    unprotected.
+    """
+    rows: set = set()
+    i, n = 0, len(lines)
+    while i < n - 1:
+        if (
+            lines[i].strip()
+            and "|" in lines[i]
+            and _TABLE_DELIM_RE.match(lines[i + 1])
+        ):
+            j = i
+            while j < n and lines[j].strip() and "|" in lines[j]:
+                rows.add(j)
+                j += 1
+            i = j
+        else:
+            i += 1
+    return rows
+
+
+def _protected_lines(lines: List[str]) -> List[bool]:
+    """Mark every line the filter must leave byte-identical.
+
+    Block-level carve-outs, decided per line with the surrounding context:
+    fenced code (closing only on a fence at least as long as the opener and
+    of the same character), indented code blocks, blockquotes and table
+    rows.
+    """
+    protected = [False] * len(lines)
+    fence_char: str = ""
+    fence_len = 0
+    in_list = False
+    in_indented_code = False
+    prev_blank = True
+    table_rows = _table_row_indices(lines)
+
+    for i, line in enumerate(lines):
+        blank = not line.strip()
+        fence = _FENCE_RE.match(line)
+
+        if fence_char:
+            # Inside a fence: everything is code, including the fence line.
+            protected[i] = True
+            if fence is not None:
+                run = fence.group("fence")
+                if (
+                    run[0] == fence_char
+                    and len(run) >= fence_len
+                    and not fence.group("info").strip()
+                ):
+                    fence_char, fence_len = "", 0
+            prev_blank = blank
+            continue
+
+        if fence:
+            fence_char = fence.group("fence")[0]
+            fence_len = len(fence.group("fence"))
+            protected[i] = True
+            in_indented_code = False
+            prev_blank = blank
+            continue
+
+        # Track list context before judging indentation: a list item's own
+        # continuation paragraph is indented but is prose, not code.
+        if not blank:
+            indent = len(line) - len(line.lstrip())
+            if indent < 4 and _LIST_ITEM_RE.match(line):
+                in_list = True
+            elif indent == 0:
+                in_list = False
+
+        if blank:
+            # A blank line neither opens nor closes an indented block.
+            prev_blank = True
+            continue
+
+        if _INDENTED_CODE_RE.match(line):
+            if in_indented_code or (prev_blank and not in_list):
+                in_indented_code = True
+                protected[i] = True
+                prev_blank = blank
+                continue
+        else:
+            in_indented_code = False
+
+        if (
+            i in table_rows
+            or _BLOCKQUOTE_RE.match(line)
+            or _TABLE_ROW_RE.match(line)
+        ):
+            protected[i] = True
+
+        prev_blank = blank
+
+    return protected
 
 
 def _mask(line: str) -> Tuple[str, List[str]]:
@@ -248,13 +369,10 @@ def strip_ai_tells(text: str) -> str:
         return text
 
     out: List[str] = []
-    in_fence = False
-    for line in text.split("\n"):
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
-            out.append(line)
-            continue
-        if in_fence or _BLOCKQUOTE_RE.match(line) or _TABLE_ROW_RE.match(line):
+    lines = text.split("\n")
+    protected = _protected_lines(lines)
+    for line, skip in zip(lines, protected):
+        if skip:
             out.append(line)
             continue
         masked, store = _mask(line)

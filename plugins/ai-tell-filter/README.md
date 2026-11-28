@@ -40,14 +40,21 @@ often than a dash.
 
 Never touched:
 
-- fenced code blocks (` ``` ` and `~~~`), including the fence lines
+- fenced code blocks (` ``` ` and `~~~`), including the fence lines. A fence
+  closes only on a run of the same character at least as long as the opener,
+  so a ` ``` ` block nested inside a ` ```` ` block stays code
+- indented code blocks: 4 spaces or a tab after a blank line. A list item's
+  own indented continuation paragraph is prose and is still cleaned
 - inline code spans, single or double backtick
 - URLs (`https:`, `ftp:`, `file:`, `mailto:`, bare `www.`), with trailing
   sentence punctuation and an unmatched closing bracket handed back to the
   prose so `[docs](https://x.test)` keeps its paren
-- absolute, relative and `~` file paths, plus bare filenames with a known
-  source/config extension
-- blockquote lines (`>`) and markdown table rows (`|`)
+- absolute, relative and `~` file paths, including bare relative paths with
+  no leading `./` such as `plugins/core.py` or `src/robust`, plus bare
+  filenames with a known source/config extension
+- blockquote lines (`>`) and GFM table rows, with or without leading pipes.
+  A table is a pipe-bearing line followed by a `--- | ---` delimiter row, so
+  ordinary prose containing a pipe is still cleaned
 - double-quoted material, straight or curly
 
 The filter is idempotent: running it on its own output is a no-op.

@@ -243,6 +243,112 @@ class TestCarveOuts:
         )
 
 
+# ---------------------------------------------------------------------------
+# Carve-out leaks found in review round 1 (each of these rewrote protected
+# material at bf2f3e31d6). One regression test per defect, plus the
+# over-protection boundary each fix must not cross: a carve-out that is too
+# wide silently switches the filter off, which is the same class of bug.
+# ---------------------------------------------------------------------------
+
+class TestRelativePathCarveOut:
+    def test_bare_directory_with_trailing_slash_untouched(self):
+        src = "The seamless/ directory holds the adapters."
+        assert strip(src) == src
+
+    def test_bare_multi_segment_path_untouched(self):
+        src = "open plugins/seamless/core.py now"
+        assert strip(src) == src
+
+    def test_extensionless_relative_path_untouched(self):
+        src = "cd into src/robust then build"
+        assert strip(src) == src
+
+    def test_relative_markdown_link_target_untouched(self):
+        assert strip("a robust [guide](robust/guide.md) here") == (
+            "a reliable [guide](robust/guide.md) here"
+        )
+
+    def test_absolute_path_still_protected(self):
+        src = "edit /opt/robust/seamless.py and ./robust_helper.py now"
+        assert strip(src) == src
+
+    def test_plain_prose_word_is_still_swapped(self):
+        """The path rule must not swallow an ordinary sentence."""
+        assert strip("a robust design, seamless too") == (
+            "a reliable design, smooth too"
+        )
+
+
+class TestIndentedCodeCarveOut:
+    def test_four_space_indented_block_untouched(self):
+        src = "Run this:\n\n    robust = compute()\n"
+        assert strip(src) == src
+
+    def test_tab_indented_block_untouched(self):
+        src = "Run this:\n\n\trobust = compute()\n"
+        assert strip(src) == src
+
+    def test_prose_after_the_block_dedents_and_is_cleaned(self):
+        src = "Run this:\n\n    robust = compute()\n\nThat is robust.\n"
+        assert strip(src) == (
+            "Run this:\n\n    robust = compute()\n\nThat is reliable.\n"
+        )
+
+    def test_indented_list_continuation_is_prose_not_code(self):
+        """List content is indented too. Over-protecting it mutes the filter."""
+        src = "- first item\n\n    a robust follow-on paragraph\n"
+        assert strip(src) == (
+            "- first item\n\n    a reliable follow-on paragraph\n"
+        )
+
+
+class TestFenceLengthCarveOut:
+    def test_inner_shorter_fence_does_not_close_the_block(self):
+        src = "````\n```\nrobust = 1\n```\n````"
+        assert strip(src) == src
+
+    def test_longer_closing_fence_closes_the_block(self):
+        src = "```\nrobust = 1\n````\n\nThat is robust.\n"
+        assert strip(src) == "```\nrobust = 1\n````\n\nThat is reliable.\n"
+
+    def test_tilde_fence_is_not_closed_by_a_backtick_fence(self):
+        src = "~~~\n```\nrobust = 1\n```\n~~~"
+        assert strip(src) == src
+
+    def test_prose_after_a_closed_fence_is_still_cleaned(self):
+        src = "```\nrobust = 1\n```\n\nThat is robust.\n"
+        assert strip(src) == "```\nrobust = 1\n```\n\nThat is reliable.\n"
+
+
+class TestTableCarveOut:
+    def test_table_without_leading_pipes_untouched(self):
+        src = "col | note\n--- | ---\nparser | robust \u2014 yes\n"
+        assert strip(src) == src
+
+    def test_header_row_above_the_delimiter_untouched(self):
+        src = "robust | note\n--- | ---\nparser | yes\n"
+        assert strip(src) == src
+
+    def test_prose_after_the_table_is_cleaned(self):
+        src = "col | note\n--- | ---\nparser | robust \u2014 yes\n\nThat is robust.\n"
+        assert strip(src) == (
+            "col | note\n--- | ---\nparser | robust \u2014 yes\n\nThat is reliable.\n"
+        )
+
+    def test_prose_containing_a_pipe_outside_a_table_is_cleaned(self):
+        """Only rows in a real table block are protected, not any pipe."""
+        assert strip("run a | b and it is robust") == (
+            "run a | b and it is reliable"
+        )
+
+    def test_consecutive_pipe_prose_lines_without_a_delimiter_are_cleaned(self):
+        """Pipes alone do not make a table: a delimiter row is required."""
+        src = "run a | b and it is robust\nthen a seamless | pipe line\n"
+        assert strip(src) == (
+            "run a | b and it is reliable\nthen a smooth | pipe line\n"
+        )
+
+
 class TestIdempotence:
     def test_running_twice_matches_running_once(self):
         src = (
